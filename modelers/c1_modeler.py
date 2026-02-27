@@ -24,6 +24,7 @@ class C1Modeler:
         load_order: LoadOrder = LoadOrder.LOAD_Q_FIRST,
         full_load: bool = False,
         preload: int = 0,
+        two_buffer: bool = False,
         hw_config: HardwareConfig = None,
     ):
         """
@@ -43,7 +44,8 @@ class C1Modeler:
             L0_db: L0是否使用双缓冲
             load_order: 加载顺序
             full_load: 是否全量加载Q矩阵
-            preload: 预加载模式 (0=正常, 1=先执行2次C1再进行C2)
+            preload: 预加载模式 (0=正常, 1=C1阶段同时预加载V，C2直接用L1中的V)
+            two_buffer: TWOBUFFER模式，V使用独立L1 slot，与K的slot互不干扰
             hw_config: 硬件配置
         """
         self.s1_total = s1_total
@@ -64,6 +66,7 @@ class C1Modeler:
         self.load_order = load_order
         self.full_load = full_load
         self.preload = preload
+        self.two_buffer = two_buffer
 
         self.timeline: List[TimelineEvent] = []
 
@@ -122,7 +125,8 @@ class C1Modeler:
         print(f"=== 开始C1流水线模拟 ===")
         print(f"特性: DN={'开启' if self.use_dn else '关闭'}, "
               f"L1_DB={'开启' if self.L1_db else '关闭'}, "
-              f"L0_DB={'开启' if self.L0_db else '关闭'}")
+              f"L0_DB={'开启' if self.L0_db else '关闭'}, "
+              f"TWOBUFFER={'开启' if self.two_buffer else '关闭'}")
 
         self.timeline.clear()
         resource_free_time = {"MTE2": 0.0, "MTE1": 0.0, "MAC": 0.0, "FIXPIPE": 0.0, "MTE3": 0.0, "VECTOR_V1": 0.0, "VECTOR_V2": 0.0}
@@ -156,13 +160,18 @@ class C1Modeler:
 
         # 主循环：根据preload模式选择不同的执行策略
         if self.preload == 1:
-            # Preload模式：先执行所有C1阶段，再执行所有C2阶段
-            print("Preload模式: 先执行2次C1，再执行C2")
+            # Preload模式：在C1加载K后立即预加载V，C2直接使用L1中的V
+            # TWOBUFFER=True时，V使用独立L1 slot，与K的slot互不干扰
+            print(f"Preload模式: C1阶段加载K后立即预加载V到L1，C2无需等V加载")
 
-            # 记录P矩阵的就绪时间，用于C2阶段
-            p_ready_times = {}
+            # 建立V的L1 slot跟踪：TWOBUFFER=True时独立，否则与K共享
+            if self.two_buffer:
+                # 独立的V L1 buffer，不与K的L1 slot竞争
+                v_l1_slots = [0.0] * num_l1_slots
+            else:
+                # 与K共享同一L1B slot数组（V需等K slot释放后才可使用）
+                v_l1_slots = map_k['l1_slots']
 
-            # 阶段1: 执行所有C1+V1
             for q_idx in range(self.q_block_count):
                 self._load_q_block(
                     q_idx, map_q, resource_free_time,
@@ -170,18 +179,15 @@ class C1Modeler:
                 )
 
                 for k_idx in range(self.k_block_count):
-                    p_ready_time = self._process_c1_stage(
-                        q_idx, k_idx, map_k, resource_free_time,
-                        q_l0_ready_times
+                    # C1阶段：加载K，同时预加载V（K加载完MTE2立即转去加载V）
+                    p_ready_time, v_l1_ready_time = self._process_c1_with_v_preload(
+                        q_idx, k_idx, map_k, v_l1_slots,
+                        resource_free_time, q_l0_ready_times
                     )
-                    p_ready_times[(q_idx, k_idx)] = p_ready_time
-
-            # 阶段2: 执行所有C2+V2
-            for q_idx in range(self.q_block_count):
-                for k_idx in range(self.k_block_count):
-                    self._process_c2_stage(
-                        q_idx, k_idx, map_k, resource_free_time,
-                        p_ready_times[(q_idx, k_idx)]
+                    # C2阶段：V已在L1，直接MTE1搬到L0，无需MTE2等待
+                    self._process_c2_with_preloaded_v(
+                        q_idx, k_idx, map_k, v_l1_slots,
+                        resource_free_time, p_ready_time, v_l1_ready_time
                     )
         else:
             # 正常模式：C1V1C2V2流水线连续执行
@@ -659,6 +665,190 @@ class C1Modeler:
                 "CUBE", q_idx, k_idx
             ))
             resource_free_time["VECTOR_V2"] = end_vector_v2
+
+    def _process_c1_with_v_preload(
+        self, q_idx: int, k_idx: int, map_k: Dict, v_l1_slots: list,
+        resource_free_time: Dict, q_l0_ready_times: Dict
+    ):
+        """
+        执行C1+V1阶段，并在K加载完成后立即预加载V到L1。
+
+        参考 mm.py 结构，V的加载不依赖V1完成时间，而是在MTE2空闲后
+        （即K的L1加载完成后）立即开始，使V加载与MAC C1 + V1 重叠。
+
+        TWOBUFFER=True时，v_l1_slots是独立数组，V不需要等K的slot释放；
+        TWOBUFFER=False时，v_l1_slots与K共享，V需等K slot可用。
+
+        Returns:
+            (p_ready_time, v_l1_ready_time): P就绪时间（V1结束），V在L1中就绪时间
+        """
+        size_k_l1 = self.s2_base * self.d_base * self._get_element_size()
+        size_k_l0 = size_k_l1
+
+        l1_name_k = map_k['l1']
+        l0_name_k = map_k['l0']
+        l1_slots_k = map_k['l1_slots']
+        l0_slots_k = map_k['l0_slots']
+
+        use_l2_for_k = self.is_l2cache and (q_idx > 0)
+
+        # A. L1加载 K (MTE2)
+        dur_k_l1 = self._calc_mte2_cycles(size_k_l1, use_l2=use_l2_for_k)
+        slot_l1_k = k_idx % len(l1_slots_k)
+        start_l1_k = max(resource_free_time["MTE2"], l1_slots_k[slot_l1_k])
+        end_l1_k = start_l1_k + dur_k_l1
+        self.timeline.append(TimelineEvent(
+            "MTE2", f"Load {l1_name_k} (K{k_idx+1})",
+            start_l1_k, end_l1_k, dur_k_l1, l1_name_k,
+            q_idx, k_idx, is_l2_hit=use_l2_for_k
+        ))
+        resource_free_time["MTE2"] = end_l1_k
+
+        # A'. 紧接着预加载V到L1（MTE2空闲后立即开始，不等待V1）
+        # TWOBUFFER=True: v_l1_slots独立，V与K的slot无冲突，可立即开始
+        # TWOBUFFER=False: v_l1_slots与K共享，需等该slot空闲（K移到L0后）
+        if self.use_dn:
+            l1_name_v = "L1A"
+            l0_name_v = "L0A"
+        else:
+            l1_name_v = "L1B"
+            l0_name_v = "L0B"
+
+        size_v = self.s2_base * self.d_base * self._get_element_size()
+        dur_v_l1 = self._calc_mte2_cycles(size_v, use_l2=use_l2_for_k)
+        slot_l1_v = k_idx % len(v_l1_slots)
+        # 关键区别：start_l1_v 只依赖 MTE2 空闲和 V slot，不依赖 V1 完成
+        start_l1_v = max(resource_free_time["MTE2"], v_l1_slots[slot_l1_v])
+        end_l1_v = start_l1_v + dur_v_l1
+        self.timeline.append(TimelineEvent(
+            "MTE2", f"Load {l1_name_v} (V{k_idx+1})",
+            start_l1_v, end_l1_v, dur_v_l1, l1_name_v, q_idx, k_idx
+        ))
+        resource_free_time["MTE2"] = end_l1_v
+        # V slot 标记为忙（直到 C2 中 MTE1 将其搬到 L0 后才更新为释放）
+        v_l1_slots[slot_l1_v] = end_l1_v
+
+        # B. L0搬运 K (MTE1)
+        dur_k_l0 = self._calc_mte1_cycles(size_k_l0)
+        slot_l0_k = k_idx % len(l0_slots_k)
+        start_l0_k = max(resource_free_time["MTE1"], end_l1_k, l0_slots_k[slot_l0_k])
+        end_l0_k = start_l0_k + dur_k_l0
+        self.timeline.append(TimelineEvent(
+            "MTE1", f"Load {l0_name_k} (K{k_idx+1})",
+            start_l0_k, end_l0_k, dur_k_l0, l0_name_k, q_idx, k_idx
+        ))
+        resource_free_time["MTE1"] = end_l0_k
+        l1_slots_k[slot_l1_k] = end_l0_k  # K L1 slot 在K移到L0后释放
+
+        # C. MAC计算 (C1: Q @ K^T -> P)
+        dur_mac_c1 = self._calc_mac_cycles(self.s1_base, self.s2_base, self.d_base)
+        start_mac_c1 = max(resource_free_time["MAC"], q_l0_ready_times[q_idx], end_l0_k)
+        end_mac_c1 = start_mac_c1 + dur_mac_c1
+        self.timeline.append(TimelineEvent(
+            "MAC", "P", start_mac_c1, end_mac_c1, dur_mac_c1,
+            "L0C", q_idx, k_idx
+        ))
+        resource_free_time["MAC"] = end_mac_c1
+        l0_slots_k[slot_l0_k] = end_mac_c1
+
+        # D. FIXPIPE (P -> UB)
+        size_p = self.s1_base * self.s2_base * self._get_element_size()
+        dur_fix_p = self._calc_fixpipe_cycles(size_p)
+        start_fix_p = max(resource_free_time["FIXPIPE"], end_mac_c1)
+        end_fix_p = start_fix_p + dur_fix_p
+        self.timeline.append(TimelineEvent(
+            "FIXPIPE", "P", start_fix_p, end_fix_p, dur_fix_p,
+            "UB", q_idx, k_idx
+        ))
+        resource_free_time["FIXPIPE"] = end_fix_p
+
+        # E. VECTOR_V1 (Softmax 等)
+        dur_vector_v1 = self._calc_vector_v1_cycles()
+        start_vector_v1 = max(resource_free_time["VECTOR_V1"], end_fix_p)
+        end_vector_v1 = start_vector_v1 + dur_vector_v1
+        self.timeline.append(TimelineEvent(
+            "VECTOR_V1", "P", start_vector_v1, end_vector_v1, dur_vector_v1,
+            "CUBE", q_idx, k_idx
+        ))
+        resource_free_time["VECTOR_V1"] = end_vector_v1
+
+        return end_vector_v1, end_l1_v  # (P就绪时间, V在L1中就绪时间)
+
+    def _process_c2_with_preloaded_v(
+        self, q_idx: int, k_idx: int, map_k: Dict, v_l1_slots: list,
+        resource_free_time: Dict, p_ready_time: float, v_l1_ready_time: float
+    ):
+        """
+        执行C2+V2阶段，V已由C1阶段预加载到L1，只需MTE1搬到L0即可。
+
+        与普通 _process_c2_stage 的区别：省去MTE2加载V这一步，
+        直接从L1（v_l1_ready_time）用MTE1搬到L0，大幅减少C2等待时间。
+        """
+        size_p = self.s1_base * self.s2_base * self._get_element_size()
+
+        if self.use_dn:
+            l0_name_v = "L0A"
+        else:
+            l0_name_v = "L0B"
+
+        l0_slots_v = map_k['l0_slots']
+        slot_l1_v = k_idx % len(v_l1_slots)
+
+        # F. MTE3: P' (UB -> CUBE)
+        dur_mte3 = self._calc_mte3_cycles(size_p)
+        start_mte3 = max(resource_free_time["MTE3"], p_ready_time)
+        end_mte3 = start_mte3 + dur_mte3
+        self.timeline.append(TimelineEvent(
+            "MTE3", "P", start_mte3, end_mte3, dur_mte3,
+            "CUBE", q_idx, k_idx
+        ))
+        resource_free_time["MTE3"] = end_mte3
+
+        # G. MTE1: V L1 -> L0 (V已在L1，跳过MTE2加载步骤)
+        size_v = self.s2_base * self.d_base * self._get_element_size()
+        dur_v_l0 = self._calc_mte1_cycles(size_v)
+        slot_l0_v = k_idx % len(l0_slots_v)
+        start_l0_v = max(resource_free_time["MTE1"], v_l1_ready_time, l0_slots_v[slot_l0_v])
+        end_l0_v = start_l0_v + dur_v_l0
+        self.timeline.append(TimelineEvent(
+            "MTE1", f"Load {l0_name_v} (V{k_idx+1})",
+            start_l0_v, end_l0_v, dur_v_l0, l0_name_v, q_idx, k_idx
+        ))
+        resource_free_time["MTE1"] = end_l0_v
+        # V L1 slot 在MTE1搬完后释放（供下一轮TWOBUFFER重用）
+        v_l1_slots[slot_l1_v] = end_l0_v
+
+        # H. MAC计算 (C2: P' @ V -> O)
+        dur_mac_c2 = self._calc_mac_cycles(self.s1_base, self.d_base, self.s2_base)
+        start_mac_c2 = max(resource_free_time["MAC"], end_mte3, end_l0_v)
+        end_mac_c2 = start_mac_c2 + dur_mac_c2
+        self.timeline.append(TimelineEvent(
+            "MAC", "O", start_mac_c2, end_mac_c2, dur_mac_c2,
+            "L0C", q_idx, k_idx
+        ))
+        resource_free_time["MAC"] = end_mac_c2
+        l0_slots_v[slot_l0_v] = end_mac_c2
+
+        # I. FIXPIPE (O -> UB)
+        size_o = self.s1_base * self.d_base * self._get_element_size()
+        dur_fix_o = self._calc_fixpipe_cycles(size_o)
+        start_fix_o = max(resource_free_time["FIXPIPE"], end_mac_c2)
+        end_fix_o = start_fix_o + dur_fix_o
+        self.timeline.append(TimelineEvent(
+            "FIXPIPE", "O", start_fix_o, end_fix_o, dur_fix_o,
+            "UB", q_idx, k_idx
+        ))
+        resource_free_time["FIXPIPE"] = end_fix_o
+
+        # J. VECTOR_V2 (后处理)
+        dur_vector_v2 = self._calc_vector_v2_cycles()
+        start_vector_v2 = max(resource_free_time["VECTOR_V2"], end_fix_o)
+        end_vector_v2 = start_vector_v2 + dur_vector_v2
+        self.timeline.append(TimelineEvent(
+            "VECTOR_V2", "O", start_vector_v2, end_vector_v2, dur_vector_v2,
+            "CUBE", q_idx, k_idx
+        ))
+        resource_free_time["VECTOR_V2"] = end_vector_v2
 
     def plot_timeline(self, timeline: List[TimelineEvent], unit_times: Dict,
                      total_cycles: float, filename: str = "timeline.png"):
