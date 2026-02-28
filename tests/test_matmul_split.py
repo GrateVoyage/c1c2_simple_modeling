@@ -120,5 +120,8 @@ def test_matmulN_fixpipe_before_next_mac():
     fixpipe_p = [e for e in timeline if e.unit == "FIXPIPE" and e.operation == "P"]
     assert len(mac_p) == 2
     assert len(fixpipe_p) == 2
-    # FIXPIPE_sub0 must end before MAC_sub1 ends (ordering constraint)
-    assert fixpipe_p[0].end_time <= mac_p[1].end_time + 0.1
+    # FIXPIPE_sub0 must end before MAC_sub1 starts (ordering constraint)
+    assert fixpipe_p[0].end_time <= mac_p[1].start_time + 0.001, (
+        f"FIXPIPE P_sub0 should end before MAC P_sub1 starts: "
+        f"fixpipe_end={fixpipe_p[0].end_time:.1f}, mac_start={mac_p[1].start_time:.1f}"
+    )
