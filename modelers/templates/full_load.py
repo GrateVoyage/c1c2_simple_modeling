@@ -2,7 +2,7 @@
 Full Load配置模板
 """
 from dataclasses import dataclass
-from core import DataType, LoadOrder
+from core import DataType, LoadOrder, InterCorePipeline, InnerCorePipeline
 from .standard import StandardConfig
 
 @dataclass
