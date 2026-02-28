@@ -421,6 +421,7 @@ class C1Modeler:
             sub_n = self.baseN_C1
             last_mac_end_c1 = 0.0
             end_l0_k = 0.0
+            end_fix_p = 0.0
             for i in range(sub_count):
                 actual_n = min(sub_n, self.s2_base - i * sub_n)
                 size_k_sub = actual_n * self.d_base * self._get_kv_element_size()
@@ -625,6 +626,7 @@ class C1Modeler:
             sub_n = self.baseN_C2
             last_mac_end_c2 = 0.0
             end_l0_v = 0.0
+            end_fix_o = 0.0
             for i in range(sub_count_c2):
                 actual_n = min(sub_n, self.d_base - i * sub_n)
                 size_v_sub = self.s2_base * actual_n * self._get_kv_element_size()
@@ -795,6 +797,7 @@ class C1Modeler:
                 sub_n = self.baseN_C1
                 last_mac_end_c1 = 0.0
                 end_l0_k = 0.0
+                end_fix_p = 0.0
                 for i in range(sub_count):
                     actual_n = min(sub_n, self.s2_base - i * sub_n)
                     size_k_sub = actual_n * self.d_base * self._get_kv_element_size()
@@ -991,6 +994,7 @@ class C1Modeler:
                 sub_n_c2 = self.baseN_C2
                 last_mac_end_c2 = 0.0
                 end_l0_v = 0.0
+                end_fix_o = 0.0
                 for i in range(sub_count_c2):
                     actual_n = min(sub_n_c2, self.d_base - i * sub_n_c2)
                     size_v_sub = self.s2_base * actual_n * self._get_kv_element_size()
@@ -1350,6 +1354,7 @@ class C1Modeler:
                 sub_n_c2 = self.baseN_C2
                 last_mac_end_c2 = 0.0
                 end_l0_v = 0.0
+                end_fix_o = 0.0
                 for i in range(sub_count_nb_c2):
                     actual_n = min(sub_n_c2, self.d_base - i * sub_n_c2)
                     size_v_sub = self.s2_base * actual_n * self._get_kv_element_size()
@@ -1535,6 +1540,7 @@ class C1Modeler:
             end_l0_k = 0.0
             v_preloaded = False
             end_l1_v = 0.0
+            end_fix_p = 0.0
             for i in range(sub_count):
                 actual_n = min(sub_n, self.s2_base - i * sub_n)
                 size_k_sub = actual_n * self.d_base * self._get_kv_element_size()
@@ -1751,6 +1757,7 @@ class C1Modeler:
             sub_n = self.baseN_C2
             last_mac_end_c2 = 0.0
             end_l0_v = 0.0
+            end_fix_o = 0.0
             for i in range(sub_count_c2):
                 actual_n = min(sub_n, self.d_base - i * sub_n)
                 size_v_sub = self.s2_base * actual_n * self._get_kv_element_size()
