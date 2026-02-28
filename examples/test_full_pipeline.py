@@ -8,7 +8,7 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from modelers import C1Modeler
-from core import DataType
+from core import DataType, InterCorePipeline, InnerCorePipeline
 
 # 使用小规模矩阵以便清晰查看完整流水线
 modeler = C1Modeler(
@@ -18,12 +18,21 @@ modeler = C1Modeler(
     s1_base_size=128,
     s2_base_size=256,
     d_base_size=128,
-    data_type=DataType.FP16,
+    q_data_type=DataType.FP16,
+    kv_data_type=DataType.FP16,
+    baseM_C1=128,
+    baseN_C1=128,
+    baseK_C1=128,
+    baseM_C2=128,
+    baseN_C2=128,
+    baseK_C2=128,
     use_dn=False,
     L1_db=True,
     L0_db=True,
     is_l2cache=False,
-    full_load=False
+    full_load=False,
+    inter_core_pipeline=InterCorePipeline.DEFAULT,
+    inner_core_pipeline=InnerCorePipeline.DEFAULT,
 )
 
 print("=" * 80)

@@ -1,5 +1,5 @@
 """
-测试Preload模式和TWOBUFFER特性
+测试InterCorePipeline模式和TWOBUFFER特性
 """
 import sys
 from pathlib import Path
@@ -8,10 +8,10 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from modelers import C1Modeler
-from core import DataType
+from core import DataType, InterCorePipeline, InnerCorePipeline
 
 print("=" * 80)
-print("测试1: Preload=0 (正常模式 - C1V1C2V2连续，V在V1后加载)")
+print("测试1: DEFAULT (顺序流水 - C1V1C2V2连续，V在V1后加载)")
 print("=" * 80)
 
 modeler = C1Modeler(
@@ -21,11 +21,19 @@ modeler = C1Modeler(
     s1_base_size=128,
     s2_base_size=256,
     d_base_size=128,
-    data_type=DataType.FP16,
+    q_data_type=DataType.FP16,
+    kv_data_type=DataType.FP16,
+    baseM_C1=128,
+    baseN_C1=128,
+    baseK_C1=128,
+    baseM_C2=128,
+    baseN_C2=128,
+    baseK_C2=128,
     use_dn=False,
     L1_db=False,
     L0_db=False,
-    preload=0
+    inter_core_pipeline=InterCorePipeline.DEFAULT,
+    inner_core_pipeline=InnerCorePipeline.DEFAULT,
 )
 
 timeline, _, unit_times, total_cycles = modeler.run_simulation()
@@ -50,7 +58,7 @@ for i, e in enumerate(timeline[:20]):
     print(f"{i:3} {e.unit:12} {e.operation:6} {label:6} [{e.start_time:7.1f}-{e.end_time:7.1f}] {e.duration:6.1f}")
 
 print("\n" + "=" * 80)
-print("测试2: Preload=1，TWOBUFFER=False (V在K加载后立即预加载，共享L1B slot)")
+print("测试2: PRELOAD (渐进式流水)，TWOBUFFER=False (V在K加载后立即预加载，共享L1B slot)")
 print("=" * 80)
 
 modeler2 = C1Modeler(
@@ -60,11 +68,19 @@ modeler2 = C1Modeler(
     s1_base_size=128,
     s2_base_size=256,
     d_base_size=128,
-    data_type=DataType.FP16,
+    q_data_type=DataType.FP16,
+    kv_data_type=DataType.FP16,
+    baseM_C1=128,
+    baseN_C1=128,
+    baseK_C1=128,
+    baseM_C2=128,
+    baseN_C2=128,
+    baseK_C2=128,
     use_dn=False,
     L1_db=False,
     L0_db=False,
-    preload=1,
+    inter_core_pipeline=InterCorePipeline.PRELOAD,
+    inner_core_pipeline=InnerCorePipeline.DEFAULT,
     two_buffer=False
 )
 
@@ -90,7 +106,7 @@ for i, e in enumerate(timeline2[:24]):
     print(f"{i:3} {e.unit:12} {e.operation:6} {label:6} [{e.start_time:7.1f}-{e.end_time:7.1f}] {e.duration:6.1f}")
 
 print("\n" + "=" * 80)
-print("测试3: Preload=1，TWOBUFFER=True (V独立L1 slot，与K无slot冲突)")
+print("测试3: PRELOAD (渐进式流水)，TWOBUFFER=True (V独立L1 slot，与K无slot冲突)")
 print("=" * 80)
 
 modeler3 = C1Modeler(
@@ -100,11 +116,19 @@ modeler3 = C1Modeler(
     s1_base_size=128,
     s2_base_size=256,
     d_base_size=128,
-    data_type=DataType.FP16,
+    q_data_type=DataType.FP16,
+    kv_data_type=DataType.FP16,
+    baseM_C1=128,
+    baseN_C1=128,
+    baseK_C1=128,
+    baseM_C2=128,
+    baseN_C2=128,
+    baseK_C2=128,
     use_dn=False,
     L1_db=False,
     L0_db=False,
-    preload=1,
+    inter_core_pipeline=InterCorePipeline.PRELOAD,
+    inner_core_pipeline=InnerCorePipeline.DEFAULT,
     two_buffer=True
 )
 
@@ -132,15 +156,15 @@ for i, e in enumerate(timeline3[:24]):
 print("\n" + "=" * 80)
 print("性能对比")
 print("=" * 80)
-print(f"Preload=0 (正常模式):              总周期 = {total_cycles:.1f}")
-print(f"Preload=1, TWOBUFFER=False:        总周期 = {total_cycles2:.1f}  ({(total_cycles-total_cycles2)/total_cycles*100:+.1f}%)")
-print(f"Preload=1, TWOBUFFER=True:         总周期 = {total_cycles3:.1f}  ({(total_cycles-total_cycles3)/total_cycles*100:+.1f}%)")
+print(f"DEFAULT (顺序流水):                总周期 = {total_cycles:.1f}")
+print(f"PRELOAD (渐进式), TWOBUFFER=False: 总周期 = {total_cycles2:.1f}  ({(total_cycles-total_cycles2)/total_cycles*100:+.1f}%)")
+print(f"PRELOAD (渐进式), TWOBUFFER=True:  总周期 = {total_cycles3:.1f}  ({(total_cycles-total_cycles3)/total_cycles*100:+.1f}%)")
 
 print("\n验证要点:")
-print("1. Preload=1时，每个k block的V在K加载完成后立即预加载（不等V1）")
+print("1. PRELOAD模式时，每个k block的V在K加载完成后立即预加载（不等V1）")
 print("2. TWOBUFFER=True时，V使用独立L1 slot，与K的slot无冲突，V可更早开始加载")
 print("3. C2阶段跳过MTE2 V加载步骤，直接MTE1从L1→L0")
 print("\n图表已保存:")
-print("  - preload_0_timeline.png         (正常模式)")
-print("  - preload_1_timeline.png         (Preload=1, TWOBUFFER=False)")
-print("  - preload_1_twobuffer_timeline.png (Preload=1, TWOBUFFER=True)")
+print("  - preload_0_timeline.png         (DEFAULT顺序流水)")
+print("  - preload_1_timeline.png         (PRELOAD渐进式, TWOBUFFER=False)")
+print("  - preload_1_twobuffer_timeline.png (PRELOAD渐进式, TWOBUFFER=True)")
