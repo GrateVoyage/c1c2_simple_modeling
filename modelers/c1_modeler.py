@@ -115,6 +115,30 @@ class C1Modeler:
         """获取数据元素大小 (deprecated: use _get_q_element_size or _get_kv_element_size)"""
         return self._get_kv_element_size()
 
+    def _calc_q_size(self) -> int:
+        """Q矩阵搬运大小 (bytes): s1_base × d_base × q_elem"""
+        return self.s1_base * self.d_base * self._get_q_element_size()
+
+    def _calc_k_size(self) -> int:
+        """K矩阵搬运大小 (bytes): s2_base × d_base × kv_elem"""
+        return self.s2_base * self.d_base * self._get_kv_element_size()
+
+    def _calc_v_size(self) -> int:
+        """V矩阵搬运大小 (bytes): s2_base × d_base × kv_elem"""
+        return self.s2_base * self.d_base * self._get_kv_element_size()
+
+    def _calc_fixpipe_p_size(self) -> int:
+        """FIXPIPE P: L0C→UB, L0C输出恒为FP32"""
+        return self.s1_base * self.s2_base * 4
+
+    def _calc_fixpipe_o_size(self) -> int:
+        """FIXPIPE O: L0C→UB, L0C输出恒为FP32"""
+        return self.s1_base * self.d_base * 4
+
+    def _calc_mte3_p_size(self) -> int:
+        """MTE3 P: UB→CUBE, P经V1后为kv_data_type格式"""
+        return self.s1_base * self.s2_base * self._get_kv_element_size()
+
     def _calc_mte2_cycles(self, size_bytes: int, use_l2: bool = False) -> float:
         """计算MTE2搬运周期数"""
         bytes_per_cycle = self.MTE2_L2_BYTES_PER_CYCLE if use_l2 else self.MTE2_DRAM_BYTES_PER_CYCLE
@@ -129,6 +153,16 @@ class C1Modeler:
         ops = m * n * k * 2
         throughput = self.hw_config.get_mac_throughput(self.kv_data_type)
         return ops / throughput
+
+    def _calc_mac_cycles_c1(self, m: int, n: int, k: int) -> float:
+        """C1阶段MAC计算周期数 (Q@K^T): 吞吐量由q_data_type和kv_data_type共同决定"""
+        ops = m * n * k * 2
+        return ops / self.hw_config.get_mac_throughput_c1(self.q_data_type, self.kv_data_type)
+
+    def _calc_mac_cycles_c2(self, m: int, n: int, k: int) -> float:
+        """C2阶段MAC计算周期数 (P@V): 吞吐量由kv_data_type决定"""
+        ops = m * n * k * 2
+        return ops / self.hw_config.get_mac_throughput_c2(self.kv_data_type)
 
     def _calc_fixpipe_cycles(self, size_bytes: int) -> float:
         """计算FIXPIPE处理周期数"""
@@ -253,7 +287,7 @@ class C1Modeler:
 
     def _preload_q_blocks(self, map_q: Dict, resource_free_time: Dict, q_l1_ready_times: Dict):
         """预加载Q块 (Full Load)"""
-        size_q = self.s1_base * self.d_base * self._get_element_size()
+        size_q = self._calc_q_size()
         dur_q = self._calc_mte2_cycles(size_q, use_l2=False)
 
         l1_name_q = map_q['l1']
@@ -280,7 +314,7 @@ class C1Modeler:
         """加载Q块"""
         # L1加载
         if not self.full_load:
-            size_q = self.s1_base * self.d_base * self._get_element_size()
+            size_q = self._calc_q_size()
             dur_q_l1 = self._calc_mte2_cycles(size_q, use_l2=False)
 
             l1_name_q = map_q['l1']
@@ -298,7 +332,7 @@ class C1Modeler:
             q_l1_ready_times[q_idx] = end_l1_q
 
         # L0搬运
-        size_q_l0 = self.s1_base * self.d_base * self._get_element_size()
+        size_q_l0 = self._calc_q_size()
         dur_q_l0 = self._calc_mte1_cycles(size_q_l0)
 
         l0_name_q = map_q['l0']
@@ -328,8 +362,8 @@ class C1Modeler:
         q_l0_ready_times: Dict
     ) -> float:
         """执行C1+V1阶段，返回P矩阵的就绪时间"""
-        size_k_l1 = self.s2_base * self.d_base * self._get_element_size()
-        size_k_l0 = size_k_l1
+        size_k = self._calc_k_size()
+        size_k_l0 = size_k
 
         l1_name_k = map_k['l1']
         l0_name_k = map_k['l0']
@@ -338,7 +372,7 @@ class C1Modeler:
 
         # A. L1加载 (MTE2)
         use_l2_for_k = self.is_l2cache and (q_idx > 0)
-        dur_k_l1 = self._calc_mte2_cycles(size_k_l1, use_l2=use_l2_for_k)
+        dur_k_l1 = self._calc_mte2_cycles(size_k, use_l2=use_l2_for_k)
 
         slot_l1_k = k_idx % len(l1_slots_k)
 
@@ -372,7 +406,7 @@ class C1Modeler:
         l1_slots_k[slot_l1_k] = end_l0_k
 
         # C. MAC计算 (C1)
-        dur_mac_c1 = self._calc_mac_cycles(self.s1_base, self.s2_base, self.d_base)
+        dur_mac_c1 = self._calc_mac_cycles_c1(self.s1_base, self.s2_base, self.d_base)
         start_mac_c1 = max(
             resource_free_time["MAC"],
             q_l0_ready_times[q_idx],
@@ -388,7 +422,7 @@ class C1Modeler:
         l0_slots_k[slot_l0_k] = end_mac_c1
 
         # D. FIXPIPE (搬运P矩阵到UB)
-        size_p = self.s1_base * self.s2_base * self._get_element_size()
+        size_p = self._calc_fixpipe_p_size()
         dur_fix_p = self._calc_fixpipe_cycles(size_p)
         start_fix_p = max(resource_free_time["FIXPIPE"], end_mac_c1)
         end_fix_p = start_fix_p + dur_fix_p
@@ -418,7 +452,7 @@ class C1Modeler:
         p_ready_time: float
     ):
         """执行C2+V2阶段"""
-        size_p = self.s1_base * self.s2_base * self._get_element_size()
+        size_p_mte3 = self._calc_mte3_p_size()
 
         l1_slots_v = map_k['l1_slots']
         l0_slots_v = map_k['l0_slots']
@@ -432,7 +466,7 @@ class C1Modeler:
             l0_name_v = "L0B"
 
         # F. MTE3 (P从UB搬回CUBE)
-        dur_mte3 = self._calc_mte3_cycles(size_p)
+        dur_mte3 = self._calc_mte3_cycles(size_p_mte3)
         start_mte3 = max(resource_free_time["MTE3"], p_ready_time)
         end_mte3 = start_mte3 + dur_mte3
 
@@ -443,7 +477,7 @@ class C1Modeler:
         resource_free_time["MTE3"] = end_mte3
 
         # G. 加载V矩阵到L1 (MTE2)
-        size_v_l1 = self.s2_base * self.d_base * self._get_element_size()
+        size_v_l1 = self._calc_v_size()
         dur_v_l1 = self._calc_mte2_cycles(size_v_l1, use_l2=False)
 
         slot_l1_v = k_idx % len(l1_slots_v)
@@ -472,7 +506,7 @@ class C1Modeler:
         l1_slots_v[slot_l1_v] = end_l0_v
 
         # I. MAC计算 (C2: P @ V -> O)
-        dur_mac_c2 = self._calc_mac_cycles(self.s1_base, self.d_base, self.s2_base)
+        dur_mac_c2 = self._calc_mac_cycles_c2(self.s1_base, self.d_base, self.s2_base)
         start_mac_c2 = max(
             resource_free_time["MAC"],
             end_mte3,
@@ -488,7 +522,7 @@ class C1Modeler:
         l0_slots_v[slot_l0_v] = end_mac_c2
 
         # J. FIXPIPE (搬运O矩阵到UB)
-        size_o = self.s1_base * self.d_base * self._get_element_size()
+        size_o = self._calc_fixpipe_o_size()
         dur_fix_o = self._calc_fixpipe_cycles(size_o)
         start_fix_o = max(resource_free_time["FIXPIPE"], end_mac_c2)
         end_fix_o = start_fix_o + dur_fix_o
@@ -515,8 +549,8 @@ class C1Modeler:
         q_l0_ready_times: Dict
     ):
         """处理K块并执行MAC计算"""
-        size_k_l1 = self.s2_base * self.d_base * self._get_element_size()
-        size_k_l0 = size_k_l1
+        size_k = self._calc_k_size()
+        size_k_l0 = size_k
 
         l1_name_k = map_k['l1']
         l0_name_k = map_k['l0']
@@ -526,7 +560,7 @@ class C1Modeler:
         for k_idx in range(self.k_block_count):
             # A. L1加载 (MTE2)
             use_l2_for_k = self.is_l2cache and (q_idx > 0)
-            dur_k_l1 = self._calc_mte2_cycles(size_k_l1, use_l2=use_l2_for_k)
+            dur_k_l1 = self._calc_mte2_cycles(size_k, use_l2=use_l2_for_k)
 
             slot_l1_k = k_idx % len(l1_slots_k)
 
@@ -562,7 +596,7 @@ class C1Modeler:
             # === C1阶段: Q @ K^T -> P ===
 
             # C. MAC计算 (C1)
-            dur_mac_c1 = self._calc_mac_cycles(self.s1_base, self.s2_base, self.d_base)
+            dur_mac_c1 = self._calc_mac_cycles_c1(self.s1_base, self.s2_base, self.d_base)
             start_mac_c1 = max(
                 resource_free_time["MAC"],
                 q_l0_ready_times[q_idx],
@@ -578,8 +612,8 @@ class C1Modeler:
             l0_slots_k[slot_l0_k] = end_mac_c1
 
             # D. FIXPIPE (搬运P矩阵到UB)
-            size_p = self.s1_base * self.s2_base * self._get_element_size()
-            dur_fix_p = self._calc_fixpipe_cycles(size_p)
+            size_p_fix = self._calc_fixpipe_p_size()
+            dur_fix_p = self._calc_fixpipe_cycles(size_p_fix)
             start_fix_p = max(resource_free_time["FIXPIPE"], end_mac_c1)
             end_fix_p = start_fix_p + dur_fix_p
 
@@ -605,7 +639,7 @@ class C1Modeler:
             # === 准备C2阶段 ===
 
             # F. MTE3 (P从UB搬回CUBE)
-            dur_mte3 = self._calc_mte3_cycles(size_p)
+            dur_mte3 = self._calc_mte3_cycles(self._calc_mte3_p_size())
             start_mte3 = max(resource_free_time["MTE3"], end_vector_v1)
             end_mte3 = start_mte3 + dur_mte3
 
@@ -628,7 +662,7 @@ class C1Modeler:
                 l1_slots_v = map_k['l1_slots']  # 复用K的路径slots
                 l0_slots_v = map_k['l0_slots']
 
-            size_v_l1 = self.s2_base * self.d_base * self._get_element_size()
+            size_v_l1 = self._calc_v_size()
             dur_v_l1 = self._calc_mte2_cycles(size_v_l1, use_l2=False)
 
             slot_l1_v = k_idx % len(l1_slots_v)
@@ -659,7 +693,7 @@ class C1Modeler:
             # === C2阶段: P @ V -> O ===
 
             # I. MAC计算 (C2: P @ V -> O)
-            dur_mac_c2 = self._calc_mac_cycles(self.s1_base, self.d_base, self.s2_base)
+            dur_mac_c2 = self._calc_mac_cycles_c2(self.s1_base, self.d_base, self.s2_base)
             start_mac_c2 = max(
                 resource_free_time["MAC"],
                 end_mte3,  # P已搬回CUBE
@@ -675,7 +709,7 @@ class C1Modeler:
             l0_slots_v[slot_l0_v] = end_mac_c2
 
             # J. FIXPIPE (搬运O矩阵到UB)
-            size_o = self.s1_base * self.d_base * self._get_element_size()
+            size_o = self._calc_fixpipe_o_size()
             dur_fix_o = self._calc_fixpipe_cycles(size_o)
             start_fix_o = max(resource_free_time["FIXPIPE"], end_mac_c2)
             end_fix_o = start_fix_o + dur_fix_o
@@ -715,8 +749,8 @@ class C1Modeler:
         Returns:
             (p_ready_time, v_l1_ready_time): P就绪时间（V1结束），V在L1中就绪时间
         """
-        size_k_l1 = self.s2_base * self.d_base * self._get_element_size()
-        size_k_l0 = size_k_l1
+        size_k = self._calc_k_size()
+        size_k_l0 = size_k
 
         l1_name_k = map_k['l1']
         l0_name_k = map_k['l0']
@@ -726,7 +760,7 @@ class C1Modeler:
         use_l2_for_k = self.is_l2cache and (q_idx > 0)
 
         # A. L1加载 K (MTE2)
-        dur_k_l1 = self._calc_mte2_cycles(size_k_l1, use_l2=use_l2_for_k)
+        dur_k_l1 = self._calc_mte2_cycles(size_k, use_l2=use_l2_for_k)
         slot_l1_k = k_idx % len(l1_slots_k)
         start_l1_k = max(resource_free_time["MTE2"], l1_slots_k[slot_l1_k])
         end_l1_k = start_l1_k + dur_k_l1
@@ -747,7 +781,7 @@ class C1Modeler:
             l1_name_v = "L1B"
             l0_name_v = "L0B"
 
-        size_v = self.s2_base * self.d_base * self._get_element_size()
+        size_v = self._calc_v_size()
         dur_v_l1 = self._calc_mte2_cycles(size_v, use_l2=use_l2_for_k)
         slot_l1_v = k_idx % len(v_l1_slots)
         # 关键区别：start_l1_v 只依赖 MTE2 空闲和 V slot，不依赖 V1 完成
@@ -774,7 +808,7 @@ class C1Modeler:
         l1_slots_k[slot_l1_k] = end_l0_k  # K L1 slot 在K移到L0后释放
 
         # C. MAC计算 (C1: Q @ K^T -> P)
-        dur_mac_c1 = self._calc_mac_cycles(self.s1_base, self.s2_base, self.d_base)
+        dur_mac_c1 = self._calc_mac_cycles_c1(self.s1_base, self.s2_base, self.d_base)
         start_mac_c1 = max(resource_free_time["MAC"], q_l0_ready_times[q_idx], end_l0_k)
         end_mac_c1 = start_mac_c1 + dur_mac_c1
         self.timeline.append(TimelineEvent(
@@ -785,8 +819,8 @@ class C1Modeler:
         l0_slots_k[slot_l0_k] = end_mac_c1
 
         # D. FIXPIPE (P -> UB)
-        size_p = self.s1_base * self.s2_base * self._get_element_size()
-        dur_fix_p = self._calc_fixpipe_cycles(size_p)
+        size_p_fix = self._calc_fixpipe_p_size()
+        dur_fix_p = self._calc_fixpipe_cycles(size_p_fix)
         start_fix_p = max(resource_free_time["FIXPIPE"], end_mac_c1)
         end_fix_p = start_fix_p + dur_fix_p
         self.timeline.append(TimelineEvent(
@@ -817,8 +851,6 @@ class C1Modeler:
         与普通 _process_c2_stage 的区别：省去MTE2加载V这一步，
         直接从L1（v_l1_ready_time）用MTE1搬到L0，大幅减少C2等待时间。
         """
-        size_p = self.s1_base * self.s2_base * self._get_element_size()
-
         if self.use_dn:
             l0_name_v = "L0A"
         else:
@@ -828,7 +860,7 @@ class C1Modeler:
         slot_l1_v = k_idx % len(v_l1_slots)
 
         # F. MTE3: P' (UB -> CUBE)
-        dur_mte3 = self._calc_mte3_cycles(size_p)
+        dur_mte3 = self._calc_mte3_cycles(self._calc_mte3_p_size())
         start_mte3 = max(resource_free_time["MTE3"], p_ready_time)
         end_mte3 = start_mte3 + dur_mte3
         self.timeline.append(TimelineEvent(
@@ -838,7 +870,7 @@ class C1Modeler:
         resource_free_time["MTE3"] = end_mte3
 
         # G. MTE1: V L1 -> L0 (V已在L1，跳过MTE2加载步骤)
-        size_v = self.s2_base * self.d_base * self._get_element_size()
+        size_v = self._calc_v_size()
         dur_v_l0 = self._calc_mte1_cycles(size_v)
         slot_l0_v = k_idx % len(l0_slots_v)
         start_l0_v = max(resource_free_time["MTE1"], v_l1_ready_time, l0_slots_v[slot_l0_v])
@@ -852,7 +884,7 @@ class C1Modeler:
         v_l1_slots[slot_l1_v] = end_l0_v
 
         # H. MAC计算 (C2: P' @ V -> O)
-        dur_mac_c2 = self._calc_mac_cycles(self.s1_base, self.d_base, self.s2_base)
+        dur_mac_c2 = self._calc_mac_cycles_c2(self.s1_base, self.d_base, self.s2_base)
         start_mac_c2 = max(resource_free_time["MAC"], end_mte3, end_l0_v)
         end_mac_c2 = start_mac_c2 + dur_mac_c2
         self.timeline.append(TimelineEvent(
@@ -863,7 +895,7 @@ class C1Modeler:
         l0_slots_v[slot_l0_v] = end_mac_c2
 
         # I. FIXPIPE (O -> UB)
-        size_o = self.s1_base * self.d_base * self._get_element_size()
+        size_o = self._calc_fixpipe_o_size()
         dur_fix_o = self._calc_fixpipe_cycles(size_o)
         start_fix_o = max(resource_free_time["FIXPIPE"], end_mac_c2)
         end_fix_o = start_fix_o + dur_fix_o
