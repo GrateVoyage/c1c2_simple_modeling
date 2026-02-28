@@ -35,3 +35,13 @@ class HardwareConfig:
     def get_mac_throughput(self, data_type: DataType) -> int:
         """获取MAC吞吐量"""
         return self.MAC_THROUGHPUT_FP16 if data_type == DataType.FP16 else self.MAC_THROUGHPUT_FP8
+
+    def get_mac_throughput_c1(self, q_dtype: DataType, kv_dtype: DataType) -> int:
+        """C1 MAC吞吐量：Q和KV都为FP8时用FP8吞吐，否则用FP16吞吐"""
+        if q_dtype == DataType.FP8 and kv_dtype == DataType.FP8:
+            return self.MAC_THROUGHPUT_FP8
+        return self.MAC_THROUGHPUT_FP16
+
+    def get_mac_throughput_c2(self, kv_dtype: DataType) -> int:
+        """C2 MAC吞吐量：由kv_data_type决定"""
+        return self.MAC_THROUGHPUT_FP8 if kv_dtype == DataType.FP8 else self.MAC_THROUGHPUT_FP16
