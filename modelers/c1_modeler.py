@@ -2,7 +2,7 @@
 C1建模器 - 单矩阵乘法流水线建模
 """
 from typing import List, Dict, Tuple
-from core import BoundType, DataType, LoadOrder, TimelineEvent, HardwareConfig
+from core import BoundType, DataType, LoadOrder, InterCorePipeline, InnerCorePipeline, TimelineEvent, HardwareConfig
 from utils.visualizer import TimelineVisualizer
 
 class C1Modeler:
@@ -16,15 +16,23 @@ class C1Modeler:
         s1_base_size: int = 128,
         s2_base_size: int = 256,
         d_base_size: int = 128,
-        data_type: DataType = DataType.FP16,
+        q_data_type: DataType = DataType.FP16,
+        kv_data_type: DataType = DataType.FP16,
+        baseM_C1: int = 128,
+        baseN_C1: int = 128,
+        baseK_C1: int = 128,
+        baseM_C2: int = 128,
+        baseN_C2: int = 128,
+        baseK_C2: int = 128,
         is_l2cache: bool = False,
         use_dn: bool = False,
         L1_db: bool = False,
         L0_db: bool = False,
         load_order: LoadOrder = LoadOrder.LOAD_Q_FIRST,
         full_load: bool = False,
-        preload: int = 0,
         two_buffer: bool = False,
+        inter_core_pipeline: InterCorePipeline = InterCorePipeline.DEFAULT,
+        inner_core_pipeline: InnerCorePipeline = InnerCorePipeline.DEFAULT,
         hw_config: HardwareConfig = None,
     ):
         """
@@ -37,15 +45,23 @@ class C1Modeler:
             s1_base_size: Q块大小
             s2_base_size: K块大小
             d_base_size: D块大小
-            data_type: 数据类型
+            q_data_type: Q矩阵数据类型
+            kv_data_type: K/V矩阵数据类型
+            baseM_C1: C1阶段M维度基本块大小
+            baseN_C1: C1阶段N维度基本块大小
+            baseK_C1: C1阶段K维度基本块大小
+            baseM_C2: C2阶段M维度基本块大小
+            baseN_C2: C2阶段N维度基本块大小
+            baseK_C2: C2阶段K维度基本块大小
             is_l2cache: 是否使用L2缓存
             use_dn: 是否使用DN模式
             L1_db: L1是否使用双缓冲
             L0_db: L0是否使用双缓冲
             load_order: 加载顺序
             full_load: 是否全量加载Q矩阵
-            preload: 预加载模式 (0=正常, 1=C1阶段同时预加载V，C2直接用L1中的V)
             two_buffer: TWOBUFFER模式，V使用独立L1 slot，与K的slot互不干扰
+            inter_core_pipeline: 核间流水线模式
+            inner_core_pipeline: 核内流水线模式
             hw_config: 硬件配置
         """
         self.s1_total = s1_total
@@ -57,7 +73,14 @@ class C1Modeler:
 
         self.q_block_count = self.s1_total // self.s1_base
         self.k_block_count = self.s2_total // self.s2_base
-        self.data_type = data_type
+        self.q_data_type = q_data_type
+        self.kv_data_type = kv_data_type
+        self.baseM_C1 = baseM_C1
+        self.baseN_C1 = baseN_C1
+        self.baseK_C1 = baseK_C1
+        self.baseM_C2 = baseM_C2
+        self.baseN_C2 = baseN_C2
+        self.baseK_C2 = baseK_C2
         self.is_l2cache = is_l2cache
 
         self.use_dn = use_dn
@@ -65,8 +88,9 @@ class C1Modeler:
         self.L0_db = L0_db
         self.load_order = load_order
         self.full_load = full_load
-        self.preload = preload
         self.two_buffer = two_buffer
+        self.inter_core_pipeline = inter_core_pipeline
+        self.inner_core_pipeline = inner_core_pipeline
 
         self.timeline: List[TimelineEvent] = []
 
@@ -79,9 +103,17 @@ class C1Modeler:
         self.MTE2_L2_BYTES_PER_CYCLE = self.hw_config.MTE2_L2_BYTES_PER_CYCLE
         self.MTE1_FIXPIPE_BYTES_PER_CYCLE = self.hw_config.MTE1_FIXPIPE_BYTES_PER_CYCLE
 
+    def _get_q_element_size(self) -> int:
+        """Q矩阵元素大小 (bytes)"""
+        return 2 if self.q_data_type == DataType.FP16 else 1
+
+    def _get_kv_element_size(self) -> int:
+        """K/V矩阵及P矩阵元素大小 (bytes)"""
+        return 2 if self.kv_data_type == DataType.FP16 else 1
+
     def _get_element_size(self) -> int:
-        """获取数据元素大小"""
-        return 2 if self.data_type == DataType.FP16 else 1
+        """获取数据元素大小 (deprecated: use _get_q_element_size or _get_kv_element_size)"""
+        return self._get_kv_element_size()
 
     def _calc_mte2_cycles(self, size_bytes: int, use_l2: bool = False) -> float:
         """计算MTE2搬运周期数"""
@@ -95,7 +127,7 @@ class C1Modeler:
     def _calc_mac_cycles(self, m: int, n: int, k: int) -> float:
         """计算MAC计算周期数"""
         ops = m * n * k * 2
-        throughput = self.hw_config.get_mac_throughput(self.data_type)
+        throughput = self.hw_config.get_mac_throughput(self.kv_data_type)
         return ops / throughput
 
     def _calc_fixpipe_cycles(self, size_bytes: int) -> float:
@@ -126,7 +158,8 @@ class C1Modeler:
         print(f"特性: DN={'开启' if self.use_dn else '关闭'}, "
               f"L1_DB={'开启' if self.L1_db else '关闭'}, "
               f"L0_DB={'开启' if self.L0_db else '关闭'}, "
-              f"TWOBUFFER={'开启' if self.two_buffer else '关闭'}")
+              f"TWOBUFFER={'开启' if self.two_buffer else '关闭'}, "
+              f"流水线={self.inter_core_pipeline.value}")
 
         self.timeline.clear()
         resource_free_time = {"MTE2": 0.0, "MTE1": 0.0, "MAC": 0.0, "FIXPIPE": 0.0, "MTE3": 0.0, "VECTOR_V1": 0.0, "VECTOR_V2": 0.0}
@@ -158,8 +191,8 @@ class C1Modeler:
         if self.full_load:
             self._preload_q_blocks(map_q, resource_free_time, q_l1_ready_times)
 
-        # 主循环：根据preload模式选择不同的执行策略
-        if self.preload == 1:
+        # 主循环：根据inter_core_pipeline模式选择不同的执行策略
+        if self.inter_core_pipeline == InterCorePipeline.PRELOAD:
             # Preload模式：在C1加载K后立即预加载V，C2直接使用L1中的V
             # TWOBUFFER=True时，V使用独立L1 slot，与K的slot互不干扰
             print(f"Preload模式: C1阶段加载K后立即预加载V到L1，C2无需等V加载")
