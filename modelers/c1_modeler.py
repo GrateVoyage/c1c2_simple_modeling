@@ -482,8 +482,42 @@ class C1Modeler:
             resource_free_time["FIXPIPE"] = end_fix_p
             l0_slots_k[slot_l0_k] = last_mac_end_c1
 
+        elif split_type == 'N':
+            # matmulN: split N (s2_base) dimension, each sub-tile gets its own FIXPIPE
+            sub_n = self.baseN_C1
+            last_mac_end_c1 = end_l0_k
+            for i in range(sub_count):
+                actual_n = min(sub_n, self.s2_base - i * sub_n)
+                dur_mac_sub = self._calc_mac_cycles_c1(self.s1_base, actual_n, self.d_base)
+                if i == 0:
+                    start_mac_sub = max(resource_free_time["MAC"],
+                                        q_l0_ready_times[q_idx], end_l0_k)
+                else:
+                    # Next sub-MAC can start after previous FIXPIPE completes
+                    start_mac_sub = max(resource_free_time["MAC"], end_fix_p)
+                end_mac_sub = start_mac_sub + dur_mac_sub
+                self.timeline.append(TimelineEvent(
+                    "MAC", "P", start_mac_sub, end_mac_sub, dur_mac_sub,
+                    "L0C", q_idx, k_idx
+                ))
+                resource_free_time["MAC"] = end_mac_sub
+                last_mac_end_c1 = end_mac_sub
+
+                # Each sub-tile gets its own FIXPIPE (no L0C accumulation)
+                size_p_sub = self.s1_base * actual_n * 4  # FP32 output
+                dur_fix_p = self._calc_fixpipe_cycles(size_p_sub)
+                start_fix_p = max(resource_free_time["FIXPIPE"], end_mac_sub)
+                end_fix_p = start_fix_p + dur_fix_p
+                self.timeline.append(TimelineEvent(
+                    "FIXPIPE", "P", start_fix_p, end_fix_p, dur_fix_p,
+                    "UB", q_idx, k_idx
+                ))
+                resource_free_time["FIXPIPE"] = end_fix_p
+
+            l0_slots_k[slot_l0_k] = last_mac_end_c1
+
         else:
-            # matmulFull (and matmulN handled in Task 8 — for now falls to full)
+            # matmulFull
             dur_mac_c1 = self._calc_mac_cycles_c1(self.s1_base, self.s2_base, self.d_base)
             start_mac_c1 = max(
                 resource_free_time["MAC"],
@@ -616,6 +650,39 @@ class C1Modeler:
             resource_free_time["FIXPIPE"] = end_fix_o
             l0_slots_v[slot_l0_v] = last_mac_end_c2
 
+        elif split_type_c2 == 'N':
+            # matmulN for C2: split d_base (N) dimension, each sub-tile gets its own FIXPIPE
+            sub_n = self.baseN_C2
+            last_mac_end_c2 = 0.0
+            for i in range(sub_count_c2):
+                actual_n = min(sub_n, self.d_base - i * sub_n)
+                dur_mac_sub = self._calc_mac_cycles_c2(self.s1_base, actual_n, self.s2_base)
+                if i == 0:
+                    start_mac_sub = max(resource_free_time["MAC"], end_mte3, end_l0_v)
+                else:
+                    # Next sub-MAC can start after previous FIXPIPE completes
+                    start_mac_sub = max(resource_free_time["MAC"], end_fix_o)
+                end_mac_sub = start_mac_sub + dur_mac_sub
+                self.timeline.append(TimelineEvent(
+                    "MAC", "O", start_mac_sub, end_mac_sub, dur_mac_sub,
+                    "L0C", q_idx, k_idx
+                ))
+                resource_free_time["MAC"] = end_mac_sub
+                last_mac_end_c2 = end_mac_sub
+
+                # Each sub-tile gets its own FIXPIPE (no L0C accumulation)
+                size_o_sub = self.s1_base * actual_n * 4  # FP32 output
+                dur_fix_o = self._calc_fixpipe_cycles(size_o_sub)
+                start_fix_o = max(resource_free_time["FIXPIPE"], end_mac_sub)
+                end_fix_o = start_fix_o + dur_fix_o
+                self.timeline.append(TimelineEvent(
+                    "FIXPIPE", "O", start_fix_o, end_fix_o, dur_fix_o,
+                    "UB", q_idx, k_idx
+                ))
+                resource_free_time["FIXPIPE"] = end_fix_o
+
+            l0_slots_v[slot_l0_v] = last_mac_end_c2
+
         else:
             # matmulFull
             dur_mac_c2 = self._calc_mac_cycles_c2(self.s1_base, self.d_base, self.s2_base)
@@ -740,8 +807,42 @@ class C1Modeler:
                 resource_free_time["FIXPIPE"] = end_fix_p
                 l0_slots_k[slot_l0_k] = last_mac_end_c1  # release L0 slot after last MAC
 
+            elif split_type == 'N':
+                # matmulN: split N (s2_base) dimension, each sub-tile gets its own FIXPIPE
+                sub_n = self.baseN_C1
+                last_mac_end_c1 = end_l0_k
+                for i in range(sub_count):
+                    actual_n = min(sub_n, self.s2_base - i * sub_n)
+                    dur_mac_sub = self._calc_mac_cycles_c1(self.s1_base, actual_n, self.d_base)
+                    if i == 0:
+                        start_mac_sub = max(resource_free_time["MAC"],
+                                            q_l0_ready_times[q_idx], end_l0_k)
+                    else:
+                        # Next sub-MAC can start after previous FIXPIPE completes
+                        start_mac_sub = max(resource_free_time["MAC"], end_fix_p)
+                    end_mac_sub = start_mac_sub + dur_mac_sub
+                    self.timeline.append(TimelineEvent(
+                        "MAC", "P", start_mac_sub, end_mac_sub, dur_mac_sub,
+                        "L0C", q_idx, k_idx
+                    ))
+                    resource_free_time["MAC"] = end_mac_sub
+                    last_mac_end_c1 = end_mac_sub
+
+                    # Each sub-tile gets its own FIXPIPE (no L0C accumulation)
+                    size_p_sub = self.s1_base * actual_n * 4  # FP32 output
+                    dur_fix_p = self._calc_fixpipe_cycles(size_p_sub)
+                    start_fix_p = max(resource_free_time["FIXPIPE"], end_mac_sub)
+                    end_fix_p = start_fix_p + dur_fix_p
+                    self.timeline.append(TimelineEvent(
+                        "FIXPIPE", "P", start_fix_p, end_fix_p, dur_fix_p,
+                        "UB", q_idx, k_idx
+                    ))
+                    resource_free_time["FIXPIPE"] = end_fix_p
+
+                l0_slots_k[slot_l0_k] = last_mac_end_c1
+
             else:
-                # matmulFull (and matmulN handled in Task 8 — for now falls to full)
+                # matmulFull
                 dur_mac_c1 = self._calc_mac_cycles_c1(self.s1_base, self.s2_base, self.d_base)
                 start_mac_c1 = max(
                     resource_free_time["MAC"],
@@ -864,6 +965,39 @@ class C1Modeler:
                     "UB", q_idx, k_idx
                 ))
                 resource_free_time["FIXPIPE"] = end_fix_o
+                l0_slots_v[slot_l0_v] = last_mac_end_c2
+
+            elif split_type_c2 == 'N':
+                # matmulN for C2: split d_base (N) dimension, each sub-tile gets its own FIXPIPE
+                sub_n = self.baseN_C2
+                last_mac_end_c2 = 0.0
+                for i in range(sub_count_c2):
+                    actual_n = min(sub_n, self.d_base - i * sub_n)
+                    dur_mac_sub = self._calc_mac_cycles_c2(self.s1_base, actual_n, self.s2_base)
+                    if i == 0:
+                        start_mac_sub = max(resource_free_time["MAC"], end_mte3, end_l0_v)
+                    else:
+                        # Next sub-MAC can start after previous FIXPIPE completes
+                        start_mac_sub = max(resource_free_time["MAC"], end_fix_o)
+                    end_mac_sub = start_mac_sub + dur_mac_sub
+                    self.timeline.append(TimelineEvent(
+                        "MAC", "O", start_mac_sub, end_mac_sub, dur_mac_sub,
+                        "L0C", q_idx, k_idx
+                    ))
+                    resource_free_time["MAC"] = end_mac_sub
+                    last_mac_end_c2 = end_mac_sub
+
+                    # Each sub-tile gets its own FIXPIPE (no L0C accumulation)
+                    size_fo_sub = self.s1_base * actual_n * 4  # FP32 output
+                    dur_fix_o = self._calc_fixpipe_cycles(size_fo_sub)
+                    start_fix_o = max(resource_free_time["FIXPIPE"], end_mac_sub)
+                    end_fix_o = start_fix_o + dur_fix_o
+                    self.timeline.append(TimelineEvent(
+                        "FIXPIPE", "O", start_fix_o, end_fix_o, dur_fix_o,
+                        "UB", q_idx, k_idx
+                    ))
+                    resource_free_time["FIXPIPE"] = end_fix_o
+
                 l0_slots_v[slot_l0_v] = last_mac_end_c2
 
             else:
@@ -993,6 +1127,41 @@ class C1Modeler:
                 l0_slots_k[slot_l0_k] = last_mac_end_c1
                 fixpipe_p_ready[k_idx] = end_fix_p
 
+            elif split_type_nb == 'N':
+                # matmulN: split N (s2_base) dimension, each sub-tile gets its own FIXPIPE
+                sub_n = self.baseN_C1
+                last_mac_end_c1 = end_l0_k
+                for i in range(sub_count_nb):
+                    actual_n = min(sub_n, self.s2_base - i * sub_n)
+                    dur_mac_sub = self._calc_mac_cycles_c1(self.s1_base, actual_n, self.d_base)
+                    if i == 0:
+                        start_mac_sub = max(resource_free_time["MAC"],
+                                            q_l0_ready_times[q_idx], end_l0_k)
+                    else:
+                        # Next sub-MAC can start after previous FIXPIPE completes
+                        start_mac_sub = max(resource_free_time["MAC"], end_fix_p)
+                    end_mac_sub = start_mac_sub + dur_mac_sub
+                    self.timeline.append(TimelineEvent(
+                        "MAC", "P", start_mac_sub, end_mac_sub, dur_mac_sub,
+                        "L0C", q_idx, k_idx
+                    ))
+                    resource_free_time["MAC"] = end_mac_sub
+                    last_mac_end_c1 = end_mac_sub
+
+                    # Each sub-tile gets its own FIXPIPE (no L0C accumulation)
+                    size_fp_sub = self.s1_base * actual_n * 4  # FP32 output
+                    dur_fix_p = self._calc_fixpipe_cycles(size_fp_sub)
+                    start_fix_p = max(resource_free_time["FIXPIPE"], end_mac_sub)
+                    end_fix_p = start_fix_p + dur_fix_p
+                    self.timeline.append(TimelineEvent(
+                        "FIXPIPE", "P", start_fix_p, end_fix_p, dur_fix_p,
+                        "UB", q_idx, k_idx
+                    ))
+                    resource_free_time["FIXPIPE"] = end_fix_p
+
+                l0_slots_k[slot_l0_k] = last_mac_end_c1
+                fixpipe_p_ready[k_idx] = end_fix_p
+
             else:
                 dur_mac_c1 = self._calc_mac_cycles_c1(self.s1_base, self.s2_base, self.d_base)
                 start_mac_c1 = max(resource_free_time["MAC"], q_l0_ready_times[q_idx], end_l0_k)
@@ -1092,6 +1261,40 @@ class C1Modeler:
                     "UB", q_idx, k_idx
                 ))
                 resource_free_time["FIXPIPE"] = end_fix_o
+                l0_slots_v[slot_l0_v] = last_mac_end_c2
+                fixpipe_o_ready[k_idx] = end_fix_o
+
+            elif split_type_nb_c2 == 'N':
+                # matmulN for C2: split d_base (N) dimension, each sub-tile gets its own FIXPIPE
+                sub_n = self.baseN_C2
+                last_mac_end_c2 = 0.0
+                for i in range(sub_count_nb_c2):
+                    actual_n = min(sub_n, self.d_base - i * sub_n)
+                    dur_mac_sub = self._calc_mac_cycles_c2(self.s1_base, actual_n, self.s2_base)
+                    if i == 0:
+                        start_mac_sub = max(resource_free_time["MAC"], end_mte3, end_l0_v)
+                    else:
+                        # Next sub-MAC can start after previous FIXPIPE completes
+                        start_mac_sub = max(resource_free_time["MAC"], end_fix_o)
+                    end_mac_sub = start_mac_sub + dur_mac_sub
+                    self.timeline.append(TimelineEvent(
+                        "MAC", "O", start_mac_sub, end_mac_sub, dur_mac_sub,
+                        "L0C", q_idx, k_idx
+                    ))
+                    resource_free_time["MAC"] = end_mac_sub
+                    last_mac_end_c2 = end_mac_sub
+
+                    # Each sub-tile gets its own FIXPIPE (no L0C accumulation)
+                    size_fo_sub = self.s1_base * actual_n * 4  # FP32 output
+                    dur_fix_o = self._calc_fixpipe_cycles(size_fo_sub)
+                    start_fix_o = max(resource_free_time["FIXPIPE"], end_mac_sub)
+                    end_fix_o = start_fix_o + dur_fix_o
+                    self.timeline.append(TimelineEvent(
+                        "FIXPIPE", "O", start_fix_o, end_fix_o, dur_fix_o,
+                        "UB", q_idx, k_idx
+                    ))
+                    resource_free_time["FIXPIPE"] = end_fix_o
+
                 l0_slots_v[slot_l0_v] = last_mac_end_c2
                 fixpipe_o_ready[k_idx] = end_fix_o
 
@@ -1237,8 +1440,42 @@ class C1Modeler:
             resource_free_time["FIXPIPE"] = end_fix_p
             l0_slots_k[slot_l0_k] = last_mac_end_c1
 
+        elif split_type == 'N':
+            # matmulN: split N (s2_base) dimension, each sub-tile gets its own FIXPIPE
+            sub_n = self.baseN_C1
+            last_mac_end_c1 = end_l0_k
+            for i in range(sub_count):
+                actual_n = min(sub_n, self.s2_base - i * sub_n)
+                dur_mac_sub = self._calc_mac_cycles_c1(self.s1_base, actual_n, self.d_base)
+                if i == 0:
+                    start_mac_sub = max(resource_free_time["MAC"],
+                                        q_l0_ready_times[q_idx], end_l0_k)
+                else:
+                    # Next sub-MAC can start after previous FIXPIPE completes
+                    start_mac_sub = max(resource_free_time["MAC"], end_fix_p)
+                end_mac_sub = start_mac_sub + dur_mac_sub
+                self.timeline.append(TimelineEvent(
+                    "MAC", "P", start_mac_sub, end_mac_sub, dur_mac_sub,
+                    "L0C", q_idx, k_idx
+                ))
+                resource_free_time["MAC"] = end_mac_sub
+                last_mac_end_c1 = end_mac_sub
+
+                # Each sub-tile gets its own FIXPIPE (no L0C accumulation)
+                size_p_sub = self.s1_base * actual_n * 4  # FP32 output
+                dur_fix_p = self._calc_fixpipe_cycles(size_p_sub)
+                start_fix_p = max(resource_free_time["FIXPIPE"], end_mac_sub)
+                end_fix_p = start_fix_p + dur_fix_p
+                self.timeline.append(TimelineEvent(
+                    "FIXPIPE", "P", start_fix_p, end_fix_p, dur_fix_p,
+                    "UB", q_idx, k_idx
+                ))
+                resource_free_time["FIXPIPE"] = end_fix_p
+
+            l0_slots_k[slot_l0_k] = last_mac_end_c1
+
         else:
-            # matmulFull (and matmulN handled in Task 8 — for now falls to full)
+            # matmulFull
             dur_mac_c1 = self._calc_mac_cycles_c1(self.s1_base, self.s2_base, self.d_base)
             start_mac_c1 = max(resource_free_time["MAC"], q_l0_ready_times[q_idx], end_l0_k)
             end_mac_c1 = start_mac_c1 + dur_mac_c1
@@ -1345,6 +1582,39 @@ class C1Modeler:
                 "UB", q_idx, k_idx
             ))
             resource_free_time["FIXPIPE"] = end_fix_o
+            l0_slots_v[slot_l0_v] = last_mac_end_c2
+
+        elif split_type_c2 == 'N':
+            # matmulN for C2: split d_base (N) dimension, each sub-tile gets its own FIXPIPE
+            sub_n = self.baseN_C2
+            last_mac_end_c2 = 0.0
+            for i in range(sub_count_c2):
+                actual_n = min(sub_n, self.d_base - i * sub_n)
+                dur_mac_sub = self._calc_mac_cycles_c2(self.s1_base, actual_n, self.s2_base)
+                if i == 0:
+                    start_mac_sub = max(resource_free_time["MAC"], end_mte3, end_l0_v)
+                else:
+                    # Next sub-MAC can start after previous FIXPIPE completes
+                    start_mac_sub = max(resource_free_time["MAC"], end_fix_o)
+                end_mac_sub = start_mac_sub + dur_mac_sub
+                self.timeline.append(TimelineEvent(
+                    "MAC", "O", start_mac_sub, end_mac_sub, dur_mac_sub,
+                    "L0C", q_idx, k_idx
+                ))
+                resource_free_time["MAC"] = end_mac_sub
+                last_mac_end_c2 = end_mac_sub
+
+                # Each sub-tile gets its own FIXPIPE (no L0C accumulation)
+                size_o_sub = self.s1_base * actual_n * 4  # FP32 output
+                dur_fix_o = self._calc_fixpipe_cycles(size_o_sub)
+                start_fix_o = max(resource_free_time["FIXPIPE"], end_mac_sub)
+                end_fix_o = start_fix_o + dur_fix_o
+                self.timeline.append(TimelineEvent(
+                    "FIXPIPE", "O", start_fix_o, end_fix_o, dur_fix_o,
+                    "UB", q_idx, k_idx
+                ))
+                resource_free_time["FIXPIPE"] = end_fix_o
+
             l0_slots_v[slot_l0_v] = last_mac_end_c2
 
         else:

@@ -73,3 +73,52 @@ def test_matmulK_c1_three_sub_macs():
     fixpipe_p = [e for e in timeline if e.unit == "FIXPIPE" and e.operation == "P"]
     assert len(mac_c1) == 3, f"Expected 3 MAC P events, got {len(mac_c1)}"
     assert len(fixpipe_p) == 1, f"Expected 1 FIXPIPE P, got {len(fixpipe_p)}"
+
+
+def test_matmulN_c1_two_fixpipes():
+    """matmulN: s2_base > baseN_C1 → 2 FIXPIPE P events (not 1)"""
+    modeler = C1Modeler(
+        s1_total=128, s2_total=256, d_total=128,
+        s1_base_size=128, s2_base_size=256, d_base_size=128,
+        baseM_C1=128, baseN_C1=128, baseK_C1=128,  # s2_base(256) > baseN_C1(128) → matmulN
+        baseM_C2=128, baseN_C2=128, baseK_C2=128,
+        q_data_type=DataType.FP16,
+        kv_data_type=DataType.FP16,
+    )
+    timeline, _, _, _ = modeler.run_simulation()
+    fixpipe_p = [e for e in timeline if e.unit == "FIXPIPE" and e.operation == "P"]
+    assert len(fixpipe_p) == 2, f"Expected 2 FIXPIPE P (matmulN), got {len(fixpipe_p)}"
+
+
+def test_matmulN_c2_two_fixpipes():
+    """matmulN C2: d_base > baseN_C2 → 2 FIXPIPE O events"""
+    modeler = C1Modeler(
+        s1_total=128, s2_total=128, d_total=256,
+        s1_base_size=128, s2_base_size=128, d_base_size=256,
+        baseM_C1=128, baseN_C1=128, baseK_C1=256,  # no split for C1
+        baseM_C2=128, baseN_C2=128, baseK_C2=256,  # d_base(256) > baseN_C2(128) → matmulN C2
+        q_data_type=DataType.FP16,
+        kv_data_type=DataType.FP16,
+    )
+    timeline, _, _, _ = modeler.run_simulation()
+    fixpipe_o = [e for e in timeline if e.unit == "FIXPIPE" and e.operation == "O"]
+    assert len(fixpipe_o) == 2, f"Expected 2 FIXPIPE O (matmulN C2), got {len(fixpipe_o)}"
+
+
+def test_matmulN_fixpipe_before_next_mac():
+    """matmulN: each FIXPIPE P_sub must complete before next MAC starts using same L0C"""
+    modeler = C1Modeler(
+        s1_total=128, s2_total=256, d_total=128,
+        s1_base_size=128, s2_base_size=256, d_base_size=128,
+        baseM_C1=128, baseN_C1=128, baseK_C1=128,
+        baseM_C2=128, baseN_C2=128, baseK_C2=128,
+        q_data_type=DataType.FP16,
+        kv_data_type=DataType.FP16,
+    )
+    timeline, _, _, _ = modeler.run_simulation()
+    mac_p = [e for e in timeline if e.unit == "MAC" and e.operation == "P"]
+    fixpipe_p = [e for e in timeline if e.unit == "FIXPIPE" and e.operation == "P"]
+    assert len(mac_p) == 2
+    assert len(fixpipe_p) == 2
+    # FIXPIPE_sub0 must end before MAC_sub1 ends (ordering constraint)
+    assert fixpipe_p[0].end_time <= mac_p[1].end_time + 0.1
