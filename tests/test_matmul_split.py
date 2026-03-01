@@ -76,7 +76,7 @@ def test_matmulK_c1_three_sub_macs():
 
 
 def test_matmulN_c1_two_fixpipes():
-    """matmulN: s2_base > baseN_C1 → 2 FIXPIPE P events (not 1)"""
+    """matmulN: s2_base > baseN_C1 → 1 FIXPIPE P (one shot after all sub-MACs)"""
     modeler = C1Modeler(
         s1_total=128, s2_total=256, d_total=128,
         s1_base_size=128, s2_base_size=256, d_base_size=128,
@@ -87,11 +87,11 @@ def test_matmulN_c1_two_fixpipes():
     )
     timeline, _, _, _ = modeler.run_simulation()
     fixpipe_p = [e for e in timeline if e.unit == "FIXPIPE" and e.operation == "P"]
-    assert len(fixpipe_p) == 2, f"Expected 2 FIXPIPE P (matmulN), got {len(fixpipe_p)}"
+    assert len(fixpipe_p) == 1, f"Expected 1 FIXPIPE P (matmulN one-shot), got {len(fixpipe_p)}"
 
 
 def test_matmulN_c2_two_fixpipes():
-    """matmulN C2: d_base > baseN_C2 → 2 FIXPIPE O events"""
+    """matmulN C2: d_base > baseN_C2 → 1 FIXPIPE O (one shot after all sub-MACs)"""
     modeler = C1Modeler(
         s1_total=128, s2_total=128, d_total=256,
         s1_base_size=128, s2_base_size=128, d_base_size=256,
@@ -102,11 +102,11 @@ def test_matmulN_c2_two_fixpipes():
     )
     timeline, _, _, _ = modeler.run_simulation()
     fixpipe_o = [e for e in timeline if e.unit == "FIXPIPE" and e.operation == "O"]
-    assert len(fixpipe_o) == 2, f"Expected 2 FIXPIPE O (matmulN C2), got {len(fixpipe_o)}"
+    assert len(fixpipe_o) == 1, f"Expected 1 FIXPIPE O (matmulN C2 one-shot), got {len(fixpipe_o)}"
 
 
 def test_matmulN_fixpipe_before_next_mac():
-    """matmulN: each FIXPIPE P_sub must complete before next MAC starts using same L0C"""
+    """matmulN: 2 sub-MACs accumulate in L0C, ONE FIXPIPE fires after last MAC"""
     modeler = C1Modeler(
         s1_total=128, s2_total=256, d_total=128,
         s1_base_size=128, s2_base_size=256, d_base_size=128,
@@ -119,9 +119,9 @@ def test_matmulN_fixpipe_before_next_mac():
     mac_p = [e for e in timeline if e.unit == "MAC" and e.operation == "P"]
     fixpipe_p = [e for e in timeline if e.unit == "FIXPIPE" and e.operation == "P"]
     assert len(mac_p) == 2
-    assert len(fixpipe_p) == 2
-    # FIXPIPE_sub0 must end before MAC_sub1 starts (ordering constraint)
-    assert fixpipe_p[0].end_time <= mac_p[1].start_time + 0.001, (
-        f"FIXPIPE P_sub0 should end before MAC P_sub1 starts: "
-        f"fixpipe_end={fixpipe_p[0].end_time:.1f}, mac_start={mac_p[1].start_time:.1f}"
+    assert len(fixpipe_p) == 1
+    # FIXPIPE must start after both MACs complete
+    assert fixpipe_p[0].start_time >= mac_p[1].end_time - 0.001, (
+        f"FIXPIPE P should start after last MAC ends: "
+        f"fixpipe_start={fixpipe_p[0].start_time:.1f}, last_mac_end={mac_p[1].end_time:.1f}"
     )

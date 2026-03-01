@@ -229,13 +229,13 @@ C1: 右矩阵 K 形状 [s2_base, d_base]，切 s2_base → 子块 [actual_n, d_b
 C2: 右矩阵 V 形状 [s2_base, d_base]，切 d_base  → 子块 [s2_base, actual_n]
 ```
 
-每个子块独立，序列为（N 维不累加 L0C，每子块有独立 FIXPIPE）：
+N 维子块写入 L0C 的不同列区域，全部子块 MAC 完成后发出一次 FIXPIPE：
 ```
 MTE2 (完整块, 1次)
 └─ for i in range(sub_count):
        MTE1_i  (子块 L1 → L0)
-       MAC_i   (i=0: 等 MTE1_i + 左矩阵就绪;  i>0: 等 MTE1_i + 上一 FIXPIPE 结束)
-       FIXPIPE_i
+       MAC_i   (i=0: 等 MTE1_i + 左矩阵就绪;  i>0: 等 MTE1_i)   ← L0C 不同列区域
+FIXPIPE (1次, 等所有 MAC 完成)
 ```
 
 L0 槽位：所有子块共用同一个 `slot_l0`，MTE1 必须等当前槽位被 MAC 释放后才能写入下一子块。L0_db 在 matmulN 内不产生流水收益（槽位不轮换）。
