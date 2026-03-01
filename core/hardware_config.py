@@ -17,11 +17,14 @@ class HardwareConfig:
     # MTE2 L2缓存带宽
     MTE2_L2_BW_GBPS: float = 5400  # GB/s
 
+    # L1 Buffer 容量 (bytes)
+    L1_CAPACITY: int = 512 * 1024  # 512 KB
+
     # MTE1 带宽 (L1 → L0, bytes/cycle)
     MTE1_BYTES_PER_CYCLE: float = 256.0
     # FIXPIPE 带宽 (L0C → UB, bytes/cycle)；参考 reference.md: 128 bytes/cycle
     FIXPIPE_BYTES_PER_CYCLE: float = 128.0
-    # MTE3 带宽 (UB → CUBE, bytes/cycle)
+    # MTE3 带宽 (UB → L1, bytes/cycle)
     MTE3_BYTES_PER_CYCLE: float = 256.0
 
     # MAC吞吐量配置

@@ -28,4 +28,5 @@ class InterCorePipeline(Enum):
 
 class InnerCorePipeline(Enum):
     """核内流水线模式"""
-    DEFAULT = "default"     # Q常驻L1，KP共用2块144K，V使用2块32K
+    DEFAULT    = "default"      # 无策略 (基础L1容量追踪: 512K内不重复MTE2)
+    Q_RESIDENT = "q_resident"   # Q常驻: Q=1×144K, KP=2×144K, V=2×32K, LRU

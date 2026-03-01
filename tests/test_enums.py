@@ -8,6 +8,7 @@ def test_inter_core_pipeline_values():
 
 def test_inner_core_pipeline_values():
     assert InnerCorePipeline.DEFAULT.value == "default"
+    assert InnerCorePipeline.Q_RESIDENT.value == "q_resident"
 
 def test_all_inter_core_pipeline_members():
     members = {e.value for e in InterCorePipeline}
@@ -15,7 +16,7 @@ def test_all_inter_core_pipeline_members():
 
 def test_all_inner_core_pipeline_members():
     members = {e.value for e in InnerCorePipeline}
-    assert members == {"default"}
+    assert members == {"default", "q_resident"}
 
 def test_bound_type_members():
     members = {e.value for e in BoundType}

@@ -83,9 +83,9 @@ HARDWARE_UNITS = {
         "用途": "搬运Q, K, V到L0"
     },
     "MTE3": {
-        "功能": "UB → CUBE",
+        "功能": "UB → L1",
         "带宽": "256 bytes/cycle",
-        "用途": "P矩阵搬回CUBE用于C2"
+        "用途": "P矩阵从UB搬回L1，再经MTE1到L0用于C2"
     },
     "MAC": {
         "功能": "矩阵乘法",
@@ -115,52 +115,62 @@ HARDWARE_UNITS = {
 STORE_UNITS = {
     "L1 Buffer": {
         "大小": "512 KB",
-        "槽位": 由 核内流水 决定。
+        "槽位": "由 核内流水 决定",
+        "缓冲区名称": "MTE2A / MTE2B (原L1A / L1B)",
     },
-    "L0A Buffer": {
+    "L0A Buffer (MTE1A)": {
         "大小": "64 KB",
-        "槽位": 由 L0_db 决定，当单个矩阵乘基本块大小小于等于32KB可开启duouble buffer。False=1个槽位，True=2个槽位。
+        "槽位": "由 L0_db 决定。False=1槽，True=2槽",
+        "用途": "标准模式存Q/P；DN模式存K/V"
     },
-    "L0B Buffer": {
+    "L0B Buffer (MTE1B)": {
         "大小": "64 KB",
-        "槽位": 由 L0_db 决定，当单个矩阵乘基本块大小小于等于32KB可开启duouble buffer。False=1个槽位，True=2个槽位。
+        "槽位": "由 L0_db 决定。False=1槽，True=2槽",
+        "用途": "标准模式存K/V；DN模式存Q/P"
     },
     "L0C Buffer": {
         "大小": "64 KB",
-        "槽位": 由 L0c_db 决定，当单个矩阵乘结果基本块大小小于等于128KB可开启duouble buffer。False=1个槽位，True=2个槽位。
+        "槽位": "由 L0c_db 决定",
+        "输出类型": "恒为FP32 (4 bytes/element)"
     },
 }
 ```
 ### 3.3 搬运及计算约束
-1. L0A和L0B必须串行，L1A和L1B必须串行。
-2. CUBE核内依赖关系如下，_表示后面组件等前面组件搬运或计算结束。
+1. L0A和L0B必须串行（共用MTE1资源），L1A和L1B也必须串行（共用MTE2资源）。
+   - 实现中 MTE2A/MTE2B 表示L1A/L1B缓冲区，MTE1A/MTE1B 表示L0A/L0B缓冲区。
+2. C2阶段P的完整路由：FIXPIPE(L0C→UB) → VECTOR_V1(UB处理) → MTE3(UB→L1) → MTE1(L1→L0A/B) → MAC-O。
+   - MAC-O 同时依赖 MTE1-P（P已在L0）和 MTE1-V（V已在L0）两个条件。
+3. CUBE核内依赖关系如下，_表示后面组件等前面组件搬运或计算结束。
 - C1
     - 消费者等生产者：
-    MTE2_MTE1、MAC_FIXPIP、MTE1_MAC
+    MTE2_MTE1、MAC_FIXPIPE、MTE1_MAC
     - 生产者等消费者：
-    MTE1_MTE2、FIXPIP_MAC、MAC_MTE1
+    MTE1_MTE2、FIXPIPE_MAC、MAC_MTE1
 - C2
     - 消费者等生产者：
-    MTE3_MTE1、MTE2_MTE1、MAC_FIXPIP、MTE1_MAC
+    MTE3_MTE1(P路由)、MTE2_MTE1(V加载)、MAC_FIXPIPE、MTE1_MAC
     - 生产者等消费者：
-    MTE1_MTE3、MTE1_MTE2、FIXPIP_MAC、MAC_MTE1
+    MTE1_MTE3、MTE1_MTE2、FIXPIPE_MAC、MAC_MTE1
 
-3. CUBE和VECTOR核间，每个基本块的C1V1C2V2都是有依赖关系的，不同基本块之间的C1V1C2V2没有依赖关系。
-4. 所有组件之间如果没有依赖关系均可并行，以最早的时间执行。
+4. CUBE和VECTOR核间，每个基本块的C1V1C2V2都是有依赖关系的，不同基本块之间的C1V1C2V2没有依赖关系。
+5. 所有组件之间如果没有依赖关系均可并行，以最早的时间执行。
+6. L0C输出恒为FP32：FIXPIPE-P搬运大小 = s1×s2×4 bytes；FIXPIPE-O大小 = s1×d×4 bytes。
 
 
 ## 4. 模式特性支持
 ### 4.1 DN模式支持
 
 **标准模式路径**:
-- Q → L1A → L0A
-- K → L1B → L0B
-- V → L1B → L0B
+- Q → MTE2A → MTE1A (L0A)
+- K → MTE2B → MTE1B (L0B)
+- V → MTE2B → MTE1B (L0B)
+- P → MTE3 → MTE2A(L1) → MTE1A (L0A)
 
 **DN模式路径**:
-- Q → L1B → L0B
-- K → L1A → L0A
-- V → L1A → L0A
+- Q → MTE2B → MTE1B (L0B)
+- K → MTE2A → MTE1A (L0A)
+- V → MTE2A → MTE1A (L0A)
+- P → MTE3 → MTE2B(L1) → MTE1B (L0B)
 
 ### 4.2 核间流水
 实际执行时默认为顺序流水，可以根据输入标志不同进行选择
@@ -178,7 +188,20 @@ N=2
 **执行顺序**: C1C1V1V1C2C2V2V2 -> C1C1V1V1C2C2V2V2 -> ... -> C1C1V1V1C2C2V2V2
 
 ### 4.3 核内流水
-暂时只考虑默认情况，Q常驻流水L1。L1=512K，Q分配1块144K的Buffer，在循环内常驻；KP共用2块144K的Buffer；V使用2块32K的Buffer，如果基本块加载数据量没有达到上限就可以一直加载，某块重复使用不需要再次用MTE2加载，可以直接使用MTE1从L1加载。如果达到上限就会从最开始加载的基本块进行替换，如果再次需要该块只能再次用MTE2加载搬运。
+支持两种策略（inner_core_pipeline 参数）：
+
+**DEFAULT（默认，基础L1容量追踪）**:
+- L1总容量 512 KB，采用平坦LRU池追踪所有块（Q/K/V/P）。
+- 若块未被驱逐仍在L1中，跳过MTE2，直接用MTE1从L1搬到L0。
+- 任何块在当前被MTE1使用后，占用L1直至被驱逐（空间不足时LRU淘汰）。
+
+**Q_RESIDENT（Q常驻）**:
+- L1分区固定（总512 KB）：
+  - Q槽：1 × 144 KB（永驻，不参与LRU淘汰）
+  - KP池：2 × 144 KB（K块和P块共享，LRU替换）
+  - V池：2 × 32 KB（LRU替换）
+- 若块在对应槽中命中，跳过MTE2直接用MTE1。
+- 超出容量时按LRU策略替换对应槽中的最旧块。
 
 ### 4.4 矩阵乘切分
 加上两组输入参数baseM_C1，baseN_C1,baseK_C1,这是c1进行矩阵乘的基本块的最大单位，参数baseM_C2，baseN_C2,baseK_C2,这是c2进行矩阵乘的基本块的最大单位。
@@ -199,8 +222,11 @@ N=2
 1. full_load=True: Q 矩阵在模拟开始前全部加载到 L1，后续不再触发 Q 的 MTE2。
 2. q_data_type=DataType.FP16/DataType.FP8，输入Q矩阵的数据类型，影响C1的Q搬运和QK计算。
 3. kv_data_type=DataType.FP16/DataType.FP8，输入K矩阵的数据类型，影响C1C2的K/P/V搬运和PV计算。
-4. L0C的得到的矩阵乘结果，即fixpip搬运的数据恒为FP32。
+4. L0C的得到的矩阵乘结果，即fixpipe搬运的数据恒为FP32。
 5. is_l2cache=True：相同基本块第一次加载使用DRAM带宽，下次加载使用L2带宽。不使能时每次均为DRAM带宽。
+   - K 块：第二个及以上 q_idx 复用时使用L2带宽（`use_l2 = is_l2cache and q_idx > 0`）
+   - V 块：同K块，第二个及以上 q_idx 使用L2带宽（`use_l2 = is_l2cache and q_idx > 0`）
+6. matmulK切分：K维度切分时L0C内累加，所有子块MAC完成后才发出一次FIXPIPE。
 
 ## 6. 可视化增强
 
@@ -208,13 +234,13 @@ N=2
 ```
 VECTOR_V2 (橙色 #E59866)  ■■■ O11 ■■■ O12
 VECTOR_V1 (黄色 #F7DC6F)  ■■■ P11 ■■■ P12
-MTE3      (灰色 #95A5A6)  ■ P11 ■ P12
+MTE3      (灰色 #95A5A6)  ■ P11 ■ P12        (UB → MTE2A/B L1缓冲)
 FIXPIPE   (绿色 #96CEB4)  ■ P11/O11
 MAC       (蓝色 #45B7D1)  ■■ P11/O11
-L0B       (青色 #4ECDC4)  ■ K1/V1
-L0A       (青色 #4ECDC4)  ■ Q1
-L1B       (红橙)          ■■ K1/V1
-L1A       (红橙)          ■■ Q1
+MTE1B     (青色 #4ECDC4)  ■ K1/V1             (原L0B)
+MTE1A     (青色 #4ECDC4)  ■ Q1/P1             (原L0A)
+MTE2B     (红橙)          ■■ K1/V1            (原L1B)
+MTE2A     (红橙)          ■■ Q1               (原L1A)
 ```
 
 ### 性能测试结果示例

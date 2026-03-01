@@ -2,9 +2,129 @@
 C1建模器 - 单矩阵乘法流水线建模
 """
 import math
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 from core import BoundType, DataType, LoadOrder, InterCorePipeline, InnerCorePipeline, TimelineEvent, HardwareConfig
 from utils.visualizer import TimelineVisualizer
+
+
+class L1CacheTracker:
+    """
+    L1缓存追踪器：判断块是否仍在L1中，决定是否可以跳过MTE2。
+
+    DEFAULT策略: 基础LRU，总容量512K。若块未被驱逐则直接用MTE1(跳过MTE2)。
+    Q_RESIDENT策略: Q=1×144K永驻; KP=2×144K LRU; V=2×32K LRU。
+    """
+
+    def __init__(self, capacity: int, strategy: InnerCorePipeline):
+        self.strategy = strategy
+        self.lru_counter = 0
+
+        if strategy == InnerCorePipeline.Q_RESIDENT:
+            # Q_RESIDENT: 固定分区
+            self.q_slot: Optional[Tuple[str, int, float]] = None  # (block_id, size, ready_time)
+            # KP pool: 2 slots × 144K
+            self.kp_slots: List[Optional[Tuple[str, int, float, int]]] = [None, None]  # (id, size, ready, lru)
+            self.kp_capacity = 144 * 1024
+            # V pool: 2 slots × 32K
+            self.v_slots: List[Optional[Tuple[str, int, float, int]]] = [None, None]   # (id, size, ready, lru)
+            self.v_capacity = 32 * 1024
+        else:
+            # DEFAULT: flat LRU pool
+            self.flat: Dict[str, Tuple[int, float, int]] = {}  # id → (size, ready, lru)
+            self.capacity = capacity
+
+    # ── DEFAULT flat cache ────────────────────────────────────────────────
+
+    def _flat_used(self) -> int:
+        return sum(v[0] for v in self.flat.values())
+
+    def _flat_check(self, block_id: str) -> Optional[float]:
+        if block_id in self.flat:
+            return self.flat[block_id][1]
+        return None
+
+    def _flat_store(self, block_id: str, size: int, ready_time: float):
+        if block_id in self.flat:
+            self.lru_counter += 1
+            self.flat[block_id] = (self.flat[block_id][0], ready_time, self.lru_counter)
+            return
+        while self._flat_used() + size > self.capacity and self.flat:
+            lru_id = min(self.flat, key=lambda k: self.flat[k][2])
+            del self.flat[lru_id]
+        self.lru_counter += 1
+        self.flat[block_id] = (size, ready_time, self.lru_counter)
+
+    # ── Q_RESIDENT pool helpers ───────────────────────────────────────────
+
+    def _pool_check(self, slots, block_id: str) -> Optional[float]:
+        for s in slots:
+            if s is not None and s[0] == block_id:
+                return s[2]
+        return None
+
+    def _pool_store(self, slots, capacity: int, block_id: str, size: int, ready_time: float):
+        # Check if already in a slot → update ready time
+        for i, s in enumerate(slots):
+            if s is not None and s[0] == block_id:
+                self.lru_counter += 1
+                slots[i] = (block_id, s[1], ready_time, self.lru_counter)
+                return
+        # Find empty slot first
+        for i, s in enumerate(slots):
+            if s is None:
+                self.lru_counter += 1
+                slots[i] = (block_id, size, ready_time, self.lru_counter)
+                return
+        # Evict LRU slot (size check: evict if new size fits in capacity)
+        lru_i = min(range(len(slots)), key=lambda i: slots[i][3])
+        self.lru_counter += 1
+        slots[lru_i] = (block_id, size, ready_time, self.lru_counter)
+
+    # ── Public interface ──────────────────────────────────────────────────
+
+    def check_q(self, block_id: str) -> Optional[float]:
+        """Returns cached l1_ready_time if Q block is in L1, else None."""
+        if self.strategy == InnerCorePipeline.Q_RESIDENT:
+            if self.q_slot is not None and self.q_slot[0] == block_id:
+                return self.q_slot[2]
+            return None
+        return self._flat_check(block_id)
+
+    def store_q(self, block_id: str, size: int, ready_time: float):
+        if self.strategy == InnerCorePipeline.Q_RESIDENT:
+            self.q_slot = (block_id, size, ready_time)
+        else:
+            self._flat_store(block_id, size, ready_time)
+
+    def check_k(self, block_id: str) -> Optional[float]:
+        if self.strategy == InnerCorePipeline.Q_RESIDENT:
+            return self._pool_check(self.kp_slots, block_id)
+        return self._flat_check(block_id)
+
+    def store_k(self, block_id: str, size: int, ready_time: float):
+        if self.strategy == InnerCorePipeline.Q_RESIDENT:
+            self._pool_store(self.kp_slots, self.kp_capacity, block_id, size, ready_time)
+        else:
+            self._flat_store(block_id, size, ready_time)
+
+    def check_v(self, block_id: str) -> Optional[float]:
+        if self.strategy == InnerCorePipeline.Q_RESIDENT:
+            return self._pool_check(self.v_slots, block_id)
+        return self._flat_check(block_id)
+
+    def store_v(self, block_id: str, size: int, ready_time: float):
+        if self.strategy == InnerCorePipeline.Q_RESIDENT:
+            self._pool_store(self.v_slots, self.v_capacity, block_id, size, ready_time)
+        else:
+            self._flat_store(block_id, size, ready_time)
+
+    def store_p(self, block_id: str, size: int, ready_time: float):
+        """P (after V1) goes into KP pool in Q_RESIDENT mode."""
+        if self.strategy == InnerCorePipeline.Q_RESIDENT:
+            self._pool_store(self.kp_slots, self.kp_capacity, block_id, size, ready_time)
+        else:
+            self._flat_store(block_id, size, ready_time)
+
 
 class C1Modeler:
     """C1建模器 - Flash Attention单矩阵乘法流水线"""
@@ -221,6 +341,9 @@ class C1Modeler:
         self.timeline.clear()
         resource_free_time = {"MTE2": 0.0, "MTE1": 0.0, "MAC": 0.0, "FIXPIPE": 0.0, "MTE3": 0.0, "VECTOR_V1": 0.0, "VECTOR_V2": 0.0}
 
+        # L1缓存追踪器
+        l1_cache = L1CacheTracker(self.hw_config.L1_CAPACITY, self.inner_core_pipeline)
+
         # 缓冲区管理初始化
         num_l1_slots = 2 if self.L1_db else 1
         l1a_free_times = [0.0] * num_l1_slots
@@ -235,18 +358,19 @@ class C1Modeler:
         q_l1_ready_times = {}
 
         # 确定Q和K的路径映射
+        # L1缓存标签: MTE2A/MTE2B (原L1A/L1B), L0标签: MTE1A/MTE1B (原L0A/L0B)
         if self.use_dn:
-            # DN模式: L1A/L0A存储K; L1B/L0B存储Q
-            map_q = {'l1': 'L1B', 'l0': 'L0B', 'l1_slots': l1b_free_times, 'l0_slots': l0b_free_times}
-            map_k = {'l1': 'L1A', 'l0': 'L0A', 'l1_slots': l1a_free_times, 'l0_slots': l0a_free_times}
+            # DN模式: MTE2A/MTE1A存储K; MTE2B/MTE1B存储Q
+            map_q = {'l1': 'MTE2B', 'l0': 'MTE1B', 'l1_slots': l1b_free_times, 'l0_slots': l0b_free_times}
+            map_k = {'l1': 'MTE2A', 'l0': 'MTE1A', 'l1_slots': l1a_free_times, 'l0_slots': l0a_free_times}
         else:
-            # 标准模式: L1A/L0A存储Q; L1B/L0B存储K
-            map_q = {'l1': 'L1A', 'l0': 'L0A', 'l1_slots': l1a_free_times, 'l0_slots': l0a_free_times}
-            map_k = {'l1': 'L1B', 'l0': 'L0B', 'l1_slots': l1b_free_times, 'l0_slots': l0b_free_times}
+            # 标准模式: MTE2A/MTE1A存储Q; MTE2B/MTE1B存储K
+            map_q = {'l1': 'MTE2A', 'l0': 'MTE1A', 'l1_slots': l1a_free_times, 'l0_slots': l0a_free_times}
+            map_k = {'l1': 'MTE2B', 'l0': 'MTE1B', 'l1_slots': l1b_free_times, 'l0_slots': l0b_free_times}
 
         # Preload Phase (Full Load)
         if self.full_load:
-            self._preload_q_blocks(map_q, resource_free_time, q_l1_ready_times)
+            self._preload_q_blocks(map_q, resource_free_time, q_l1_ready_times, l1_cache)
 
         # 主循环：根据inter_core_pipeline模式选择不同的执行策略
         if self.inter_core_pipeline == InterCorePipeline.PRELOAD:
@@ -257,7 +381,7 @@ class C1Modeler:
             for q_idx in range(self.q_block_count):
                 self._load_q_block(
                     q_idx, map_q, resource_free_time,
-                    q_l1_ready_times, q_l0_ready_times
+                    q_l1_ready_times, q_l0_ready_times, l1_cache
                 )
 
                 c1_fix_ends = []  # 保存每个 k_idx 的 end_fix_p
@@ -265,7 +389,7 @@ class C1Modeler:
                 for k_idx in range(self.k_block_count):
                     # 立即发射 C1[k]（只等 C1 相关硬件资源：MTE2/MTE1/MAC/FIXPIPE）
                     end_fix_p = self._process_c1_only(
-                        q_idx, k_idx, map_k, resource_free_time, q_l0_ready_times
+                        q_idx, k_idx, map_k, resource_free_time, q_l0_ready_times, l1_cache
                     )
                     c1_fix_ends.append(end_fix_p)
 
@@ -276,7 +400,7 @@ class C1Modeler:
                             q_idx, prev, resource_free_time, c1_fix_ends[prev]
                         )
                         self._process_c2_stage(
-                            q_idx, prev, map_k, resource_free_time, end_v1
+                            q_idx, prev, map_q, map_k, resource_free_time, end_v1, l1_cache
                         )
 
                 # 收尾：最后一个 k 的 V1 + C2 + V2
@@ -286,7 +410,7 @@ class C1Modeler:
                         q_idx, last, resource_free_time, c1_fix_ends[last]
                     )
                     self._process_c2_stage(
-                        q_idx, last, map_k, resource_free_time, end_v1
+                        q_idx, last, map_q, map_k, resource_free_time, end_v1, l1_cache
                     )
         elif self.inter_core_pipeline == InterCorePipeline.N_BUFFER:
             # N_BUFFER模式（N=2）：将k-block分组，组内按阶段批次执行
@@ -297,24 +421,24 @@ class C1Modeler:
             n_size = 2
             for q_idx in range(self.q_block_count):
                 self._load_q_block(q_idx, map_q, resource_free_time,
-                                   q_l1_ready_times, q_l0_ready_times)
+                                   q_l1_ready_times, q_l0_ready_times, l1_cache)
                 for group_start in range(0, self.k_block_count, n_size):
                     group = list(range(group_start,
                                        min(group_start + n_size, self.k_block_count)))
                     self._process_n_buffer_group(
-                        q_idx, group, map_k, resource_free_time, q_l0_ready_times
+                        q_idx, group, map_q, map_k, resource_free_time, q_l0_ready_times, l1_cache
                     )
         else:
             # 正常模式：C1V1C2V2流水线连续执行
             for q_idx in range(self.q_block_count):
                 self._load_q_block(
                     q_idx, map_q, resource_free_time,
-                    q_l1_ready_times, q_l0_ready_times
+                    q_l1_ready_times, q_l0_ready_times, l1_cache
                 )
 
                 self._process_k_blocks(
-                    q_idx, map_k, resource_free_time,
-                    q_l0_ready_times
+                    q_idx, map_q, map_k, resource_free_time,
+                    q_l0_ready_times, l1_cache
                 )
 
         # 统计
@@ -333,7 +457,8 @@ class C1Modeler:
         print(f"=== 模拟结束 ===")
         return self.timeline, bound_type, unit_times, total_cycles
 
-    def _preload_q_blocks(self, map_q: Dict, resource_free_time: Dict, q_l1_ready_times: Dict):
+    def _preload_q_blocks(self, map_q: Dict, resource_free_time: Dict,
+                          q_l1_ready_times: Dict, l1_cache: L1CacheTracker):
         """预加载Q块 (Full Load)"""
         size_q = self._calc_q_size()
         dur_q = self._calc_mte2_cycles(size_q, use_l2=False)
@@ -343,6 +468,13 @@ class C1Modeler:
 
         for q_idx in range(self.q_block_count):
             slot_idx = q_idx % len(l1_slots_q)
+            block_id = f"Q{q_idx}"
+
+            cached_time = l1_cache.check_q(block_id)
+            if cached_time is not None:
+                # Already in L1, skip MTE2
+                q_l1_ready_times[q_idx] = cached_time
+                continue
 
             start = max(resource_free_time["MTE2"], l1_slots_q[slot_idx])
             end = start + dur_q
@@ -354,30 +486,38 @@ class C1Modeler:
             resource_free_time["MTE2"] = end
             q_l1_ready_times[q_idx] = end
             l1_slots_q[slot_idx] = end
+            l1_cache.store_q(block_id, size_q, end)
 
     def _load_q_block(
         self, q_idx: int, map_q: Dict, resource_free_time: Dict,
-        q_l1_ready_times: Dict, q_l0_ready_times: Dict
+        q_l1_ready_times: Dict, q_l0_ready_times: Dict,
+        l1_cache: L1CacheTracker
     ):
         """加载Q块"""
         # L1加载
         if not self.full_load:
             size_q = self._calc_q_size()
-            dur_q_l1 = self._calc_mte2_cycles(size_q, use_l2=False)
-
             l1_name_q = map_q['l1']
             l1_slots_q = map_q['l1_slots']
             slot_l1_q = q_idx % len(l1_slots_q)
+            block_id = f"Q{q_idx}"
 
-            start_l1_q = max(resource_free_time["MTE2"], l1_slots_q[slot_l1_q])
-            end_l1_q = start_l1_q + dur_q_l1
+            cached_time = l1_cache.check_q(block_id)
+            if cached_time is not None:
+                # Block still in L1 - skip MTE2
+                q_l1_ready_times[q_idx] = cached_time
+            else:
+                dur_q_l1 = self._calc_mte2_cycles(size_q, use_l2=False)
+                start_l1_q = max(resource_free_time["MTE2"], l1_slots_q[slot_l1_q])
+                end_l1_q = start_l1_q + dur_q_l1
 
-            self.timeline.append(TimelineEvent(
-                "MTE2", f"Load {l1_name_q} (Q{q_idx+1})",
-                start_l1_q, end_l1_q, dur_q_l1, l1_name_q, q_idx, -1
-            ))
-            resource_free_time["MTE2"] = end_l1_q
-            q_l1_ready_times[q_idx] = end_l1_q
+                self.timeline.append(TimelineEvent(
+                    "MTE2", f"Load {l1_name_q} (Q{q_idx+1})",
+                    start_l1_q, end_l1_q, dur_q_l1, l1_name_q, q_idx, -1
+                ))
+                resource_free_time["MTE2"] = end_l1_q
+                q_l1_ready_times[q_idx] = end_l1_q
+                l1_cache.store_q(block_id, size_q, end_l1_q)
 
         # L0搬运
         size_q_l0 = self._calc_q_size()
@@ -404,6 +544,35 @@ class C1Modeler:
         resource_free_time["MTE1"] = end_l0_q
         q_l0_ready_times[q_idx] = end_l0_q
         l1_slots_q[slot_l1_q] = end_l0_q
+
+    def _mte2_to_l1(
+        self, block_id: str, size: int, use_l2: bool,
+        l1_name: str, l1_slots: list, slot_idx: int,
+        resource_free_time: Dict, q_idx: int, k_idx: int,
+        event_label: str, l1_cache: L1CacheTracker, cache_type: str
+    ) -> float:
+        """
+        尝试从L1缓存获取块；如果命中则跳过MTE2，否则执行MTE2并更新缓存。
+        返回 l1_ready_time (MTE2完成时间或缓存时间)。
+        cache_type: 'k', 'v', 'q'
+        """
+        check = {'k': l1_cache.check_k, 'v': l1_cache.check_v, 'q': l1_cache.check_q}[cache_type]
+        store = {'k': l1_cache.store_k, 'v': l1_cache.store_v, 'q': l1_cache.store_q}[cache_type]
+
+        cached = check(block_id)
+        if cached is not None:
+            return cached  # 跳过MTE2
+
+        dur = self._calc_mte2_cycles(size, use_l2=use_l2)
+        start = max(resource_free_time["MTE2"], l1_slots[slot_idx])
+        end = start + dur
+        self.timeline.append(TimelineEvent(
+            "MTE2", event_label, start, end, dur, l1_name, q_idx, k_idx,
+            is_l2_hit=use_l2
+        ))
+        resource_free_time["MTE2"] = end
+        store(block_id, size, end)
+        return end
 
     def _process_c1_stage(
         self, q_idx: int, k_idx: int, map_k: Dict, resource_free_time: Dict,
@@ -594,7 +763,7 @@ class C1Modeler:
 
     def _process_c1_only(
         self, q_idx: int, k_idx: int, map_k: Dict, resource_free_time: Dict,
-        q_l0_ready_times: Dict
+        q_l0_ready_times: Dict, l1_cache: L1CacheTracker
     ) -> float:
         """执行C1阶段（K加载 + MAC-P + FIXPIPE-P），不包含VECTOR_V1，返回end_fix_p"""
         l1_name_k = map_k['l1']
@@ -617,15 +786,11 @@ class C1Modeler:
                 actual_n = min(sub_n, self.s2_base - i * sub_n)
                 size_k_sub = actual_n * self.d_base * self._get_kv_element_size()
 
-                dur_k_sub_l1 = self._calc_mte2_cycles(size_k_sub, use_l2=use_l2_for_k)
-                start_l1_k_sub = max(resource_free_time["MTE2"], l1_slots_k[slot_l1_k])
-                end_l1_k_sub = start_l1_k_sub + dur_k_sub_l1
-                self.timeline.append(TimelineEvent(
-                    "MTE2", f"Load {l1_name_k} (K{k_idx+1}_sub{i})",
-                    start_l1_k_sub, end_l1_k_sub, dur_k_sub_l1, l1_name_k,
-                    q_idx, k_idx, is_l2_hit=use_l2_for_k
-                ))
-                resource_free_time["MTE2"] = end_l1_k_sub
+                end_l1_k_sub = self._mte2_to_l1(
+                    f"K{k_idx}_sub{i}", size_k_sub, use_l2_for_k,
+                    l1_name_k, l1_slots_k, slot_l1_k, resource_free_time, q_idx, k_idx,
+                    f"Load {l1_name_k} (K{k_idx+1}_sub{i})", l1_cache, 'k'
+                )
 
                 dur_k_sub_l0 = self._calc_mte1_cycles(size_k_sub)
                 start_l0_k_sub = max(
@@ -671,15 +836,11 @@ class C1Modeler:
         else:
             size_k = self._calc_k_size()
 
-            dur_k_l1 = self._calc_mte2_cycles(size_k, use_l2=use_l2_for_k)
-            start_l1_k = max(resource_free_time["MTE2"], l1_slots_k[slot_l1_k])
-            end_l1_k = start_l1_k + dur_k_l1
-            self.timeline.append(TimelineEvent(
-                "MTE2", f"Load {l1_name_k} (K{k_idx+1})",
-                start_l1_k, end_l1_k, dur_k_l1, l1_name_k,
-                q_idx, k_idx, is_l2_hit=use_l2_for_k
-            ))
-            resource_free_time["MTE2"] = end_l1_k
+            end_l1_k = self._mte2_to_l1(
+                f"K{k_idx}", size_k, use_l2_for_k,
+                l1_name_k, l1_slots_k, slot_l1_k, resource_free_time, q_idx, k_idx,
+                f"Load {l1_name_k} (K{k_idx+1})", l1_cache, 'k'
+            )
 
             dur_k_l0 = self._calc_mte1_cycles(size_k)
             start_l0_k = max(
@@ -764,33 +925,55 @@ class C1Modeler:
         return end
 
     def _process_c2_stage(
-        self, q_idx: int, k_idx: int, map_k: Dict, resource_free_time: Dict,
-        p_ready_time: float
+        self, q_idx: int, k_idx: int, map_q: Dict, map_k: Dict,
+        resource_free_time: Dict, p_ready_time: float,
+        l1_cache: L1CacheTracker
     ):
         """执行C2+V2阶段"""
         size_p_mte3 = self._calc_mte3_p_size()
 
+        # P路径 (同Q路径): 标准模式使用MTE2A/MTE1A; DN模式使用MTE2B/MTE1B
+        l1_name_p = map_q['l1']
+        l0_name_p = map_q['l0']
+        l0_slots_p = map_q['l0_slots']
+
+        # V路径 (同K路径): 标准模式使用MTE2B/MTE1B; DN模式使用MTE2A/MTE1A
         l1_slots_v = map_k['l1_slots']
         l0_slots_v = map_k['l0_slots']
-
-        # 路径映射
         if self.use_dn:
-            l1_name_v = "L1A"
-            l0_name_v = "L0A"
+            l1_name_v = "MTE2A"
+            l0_name_v = "MTE1A"
         else:
-            l1_name_v = "L1B"
-            l0_name_v = "L0B"
+            l1_name_v = "MTE2B"
+            l0_name_v = "MTE1B"
 
-        # F. MTE3 (P从UB搬回CUBE)
+        # F. MTE3 (P从UB搬到L1)
         dur_mte3 = self._calc_mte3_cycles(size_p_mte3)
         start_mte3 = max(resource_free_time["MTE3"], p_ready_time)
         end_mte3 = start_mte3 + dur_mte3
 
         self.timeline.append(TimelineEvent(
             "MTE3", "P", start_mte3, end_mte3, dur_mte3,
-            "CUBE", q_idx, k_idx
+            l1_name_p, q_idx, k_idx
         ))
         resource_free_time["MTE3"] = end_mte3
+        l1_cache.store_p(f"P{q_idx}_{k_idx}", size_p_mte3, end_mte3)
+
+        # G. MTE1 (P从L1搬到L0A/L0B)
+        size_p_mte1 = size_p_mte3
+        dur_mte1_p = self._calc_mte1_cycles(size_p_mte1)
+        slot_l0_p = k_idx % len(l0_slots_p)
+        start_mte1_p = max(resource_free_time["MTE1"], end_mte3, l0_slots_p[slot_l0_p])
+        end_mte1_p = start_mte1_p + dur_mte1_p
+        self.timeline.append(TimelineEvent(
+            "MTE1", f"Load {l0_name_p} (P{q_idx+1}{k_idx+1})",
+            start_mte1_p, end_mte1_p, dur_mte1_p, l0_name_p, q_idx, k_idx
+        ))
+        resource_free_time["MTE1"] = end_mte1_p
+        l0_slots_p[slot_l0_p] = end_mte1_p
+
+        # V加载是否使用L2缓存 (q_idx>0时同一V块第二次访问)
+        use_l2_for_v = self.is_l2cache and (q_idx > 0)
 
         # I. MAC计算 (C2: P @ V -> O) with optional matmul splitting
         split_type_c2, sub_count_c2 = self._get_c2_split()
@@ -808,15 +991,22 @@ class C1Modeler:
                 actual_n = min(sub_n, self.d_base - i * sub_n)
                 size_v_sub = self.s2_base * actual_n * self._get_kv_element_size()
 
-                # MTE2 V_sub[i]: load sub-tile to L1
-                dur_v_sub_l1 = self._calc_mte2_cycles(size_v_sub, use_l2=False)
-                start_l1_v_sub = max(resource_free_time["MTE2"], l1_slots_v[slot_l1_v], p_ready_time)
-                end_l1_v_sub = start_l1_v_sub + dur_v_sub_l1
-                self.timeline.append(TimelineEvent(
-                    "MTE2", f"Load {l1_name_v} (V{k_idx+1}_sub{i})",
-                    start_l1_v_sub, end_l1_v_sub, dur_v_sub_l1, l1_name_v, q_idx, k_idx
-                ))
-                resource_free_time["MTE2"] = end_l1_v_sub
+                # MTE2 V_sub[i]: load sub-tile to L1 (with L1 cache check)
+                block_id_v_sub = f"V{k_idx}_sub{i}"
+                cached_v_sub = l1_cache.check_v(block_id_v_sub)
+                if cached_v_sub is not None:
+                    end_l1_v_sub = cached_v_sub
+                else:
+                    dur_v_sub_l1 = self._calc_mte2_cycles(size_v_sub, use_l2=use_l2_for_v)
+                    start_l1_v_sub = max(resource_free_time["MTE2"], l1_slots_v[slot_l1_v], p_ready_time)
+                    end_l1_v_sub = start_l1_v_sub + dur_v_sub_l1
+                    self.timeline.append(TimelineEvent(
+                        "MTE2", f"Load {l1_name_v} (V{k_idx+1}_sub{i})",
+                        start_l1_v_sub, end_l1_v_sub, dur_v_sub_l1, l1_name_v,
+                        q_idx, k_idx, is_l2_hit=use_l2_for_v
+                    ))
+                    resource_free_time["MTE2"] = end_l1_v_sub
+                    l1_cache.store_v(block_id_v_sub, size_v_sub, end_l1_v_sub)
 
                 # MTE1 V_sub[i]: move sub-tile from L1 to L0
                 dur_v_sub_l0 = self._calc_mte1_cycles(size_v_sub)
@@ -832,7 +1022,7 @@ class C1Modeler:
 
                 dur_mac_sub = self._calc_mac_cycles_c2(self.s1_base, actual_n, self.s2_base)
                 if i == 0:
-                    start_mac_sub = max(resource_free_time["MAC"], end_mte3, end_l0_v_sub)
+                    start_mac_sub = max(resource_free_time["MAC"], end_mte1_p, end_l0_v_sub)
                 else:
                     # Next sub-MAC can start after previous FIXPIPE completes
                     start_mac_sub = max(resource_free_time["MAC"], end_fix_o, end_l0_v_sub)
@@ -858,16 +1048,23 @@ class C1Modeler:
             l0_slots_v[slot_l0_v] = last_mac_end_c2
 
         else:
-            # For 'K' and 'full': monolithic V load before MAC
+            # For 'K' and 'full': monolithic V load before MAC (with L1 cache check)
             size_v_l1 = self._calc_v_size()
-            dur_v_l1 = self._calc_mte2_cycles(size_v_l1, use_l2=False)
-            start_l1_v = max(resource_free_time["MTE2"], l1_slots_v[slot_l1_v], p_ready_time)
-            end_l1_v = start_l1_v + dur_v_l1
-            self.timeline.append(TimelineEvent(
-                "MTE2", f"Load {l1_name_v} (V{k_idx+1})",
-                start_l1_v, end_l1_v, dur_v_l1, l1_name_v, q_idx, k_idx
-            ))
-            resource_free_time["MTE2"] = end_l1_v
+            block_id_v = f"V{k_idx}"
+            cached_v = l1_cache.check_v(block_id_v)
+            if cached_v is not None:
+                end_l1_v = cached_v
+            else:
+                dur_v_l1 = self._calc_mte2_cycles(size_v_l1, use_l2=use_l2_for_v)
+                start_l1_v = max(resource_free_time["MTE2"], l1_slots_v[slot_l1_v], p_ready_time)
+                end_l1_v = start_l1_v + dur_v_l1
+                self.timeline.append(TimelineEvent(
+                    "MTE2", f"Load {l1_name_v} (V{k_idx+1})",
+                    start_l1_v, end_l1_v, dur_v_l1, l1_name_v,
+                    q_idx, k_idx, is_l2_hit=use_l2_for_v
+                ))
+                resource_free_time["MTE2"] = end_l1_v
+                l1_cache.store_v(block_id_v, size_v_l1, end_l1_v)
 
             # H. V矩阵搬运到L0 (MTE1)
             size_v_l0 = size_v_l1
@@ -889,7 +1086,7 @@ class C1Modeler:
                     actual_k = min(sub_k, self.s2_base - i * sub_k)
                     dur_mac_sub = self._calc_mac_cycles_c2(self.s1_base, self.d_base, actual_k)
                     if i == 0:
-                        start_mac_sub = max(resource_free_time["MAC"], end_mte3, end_l0_v)
+                        start_mac_sub = max(resource_free_time["MAC"], end_mte1_p, end_l0_v)
                     else:
                         start_mac_sub = resource_free_time["MAC"]
                     end_mac_sub = start_mac_sub + dur_mac_sub
@@ -916,8 +1113,8 @@ class C1Modeler:
                 dur_mac_c2 = self._calc_mac_cycles_c2(self.s1_base, self.d_base, self.s2_base)
                 start_mac_c2 = max(
                     resource_free_time["MAC"],
-                    end_mte3,
-                    end_l0_v
+                    end_mte1_p,  # P已搬到L0
+                    end_l0_v     # V已在L0
                 )
                 end_mac_c2 = start_mac_c2 + dur_mac_c2
 
@@ -952,8 +1149,8 @@ class C1Modeler:
         resource_free_time["VECTOR_V2"] = end_vector_v2
 
     def _process_k_blocks(
-        self, q_idx: int, map_k: Dict, resource_free_time: Dict,
-        q_l0_ready_times: Dict
+        self, q_idx: int, map_q: Dict, map_k: Dict, resource_free_time: Dict,
+        q_l0_ready_times: Dict, l1_cache: L1CacheTracker
     ):
         """处理K块并执行MAC计算"""
         l1_name_k = map_k['l1']
@@ -979,16 +1176,12 @@ class C1Modeler:
                     actual_n = min(sub_n, self.s2_base - i * sub_n)
                     size_k_sub = actual_n * self.d_base * self._get_kv_element_size()
 
-                    # MTE2 K_sub[i]: load sub-tile to L1
-                    dur_k_sub_l1 = self._calc_mte2_cycles(size_k_sub, use_l2=use_l2_for_k)
-                    start_l1_k_sub = max(resource_free_time["MTE2"], l1_slots_k[slot_l1_k])
-                    end_l1_k_sub = start_l1_k_sub + dur_k_sub_l1
-                    self.timeline.append(TimelineEvent(
-                        "MTE2", f"Load {l1_name_k} (K{k_idx+1}_sub{i})",
-                        start_l1_k_sub, end_l1_k_sub, dur_k_sub_l1, l1_name_k,
-                        q_idx, k_idx, is_l2_hit=use_l2_for_k
-                    ))
-                    resource_free_time["MTE2"] = end_l1_k_sub
+                    # MTE2 K_sub[i]: load sub-tile to L1 (with L1 cache check)
+                    end_l1_k_sub = self._mte2_to_l1(
+                        f"K{k_idx}_sub{i}", size_k_sub, use_l2_for_k,
+                        l1_name_k, l1_slots_k, slot_l1_k, resource_free_time, q_idx, k_idx,
+                        f"Load {l1_name_k} (K{k_idx+1}_sub{i})", l1_cache, 'k'
+                    )
 
                     # MTE1 K_sub[i]: move sub-tile from L1 to L0B
                     dur_k_sub_l0 = self._calc_mte1_cycles(size_k_sub)
@@ -1038,16 +1231,12 @@ class C1Modeler:
                 # For 'K' and 'full': monolithic K load before MAC
                 size_k = self._calc_k_size()
 
-                # A. L1加载 (MTE2)
-                dur_k_l1 = self._calc_mte2_cycles(size_k, use_l2=use_l2_for_k)
-                start_l1_k = max(resource_free_time["MTE2"], l1_slots_k[slot_l1_k])
-                end_l1_k = start_l1_k + dur_k_l1
-                self.timeline.append(TimelineEvent(
-                    "MTE2", f"Load {l1_name_k} (K{k_idx+1})",
-                    start_l1_k, end_l1_k, dur_k_l1, l1_name_k,
-                    q_idx, k_idx, is_l2_hit=use_l2_for_k
-                ))
-                resource_free_time["MTE2"] = end_l1_k
+                # A. L1加载 (MTE2, with L1 cache check)
+                end_l1_k = self._mte2_to_l1(
+                    f"K{k_idx}", size_k, use_l2_for_k,
+                    l1_name_k, l1_slots_k, slot_l1_k, resource_free_time, q_idx, k_idx,
+                    f"Load {l1_name_k} (K{k_idx+1})", l1_cache, 'k'
+                )
 
                 # B. L0搬运 (MTE1)
                 dur_k_l0 = self._calc_mte1_cycles(size_k)
@@ -1137,26 +1326,46 @@ class C1Modeler:
 
             # === 准备C2阶段 ===
 
-            # F. MTE3 (P从UB搬回CUBE)
+            # F. MTE3 (P从UB搬到L1)
             dur_mte3 = self._calc_mte3_cycles(self._calc_mte3_p_size())
+            l1_name_p = map_q['l1']
+            l0_name_p = map_q['l0']
+            l0_slots_p = map_q['l0_slots']
             start_mte3 = max(resource_free_time["MTE3"], end_vector_v1)
             end_mte3 = start_mte3 + dur_mte3
 
             self.timeline.append(TimelineEvent(
                 "MTE3", "P", start_mte3, end_mte3, dur_mte3,
-                "CUBE", q_idx, k_idx
+                l1_name_p, q_idx, k_idx
             ))
             resource_free_time["MTE3"] = end_mte3
+            l1_cache.store_p(f"P{q_idx}_{k_idx}", self._calc_mte3_p_size(), end_mte3)
 
-            # DN模式: V使用L1A路径；标准模式: V使用L1B路径
+            # G. MTE1 (P从L1搬到L0A/L0B)
+            size_p_mte1 = self._calc_mte3_p_size()
+            dur_mte1_p = self._calc_mte1_cycles(size_p_mte1)
+            slot_l0_p = k_idx % len(l0_slots_p)
+            start_mte1_p = max(resource_free_time["MTE1"], end_mte3, l0_slots_p[slot_l0_p])
+            end_mte1_p = start_mte1_p + dur_mte1_p
+            self.timeline.append(TimelineEvent(
+                "MTE1", f"Load {l0_name_p} (P{q_idx+1}{k_idx+1})",
+                start_mte1_p, end_mte1_p, dur_mte1_p, l0_name_p, q_idx, k_idx
+            ))
+            resource_free_time["MTE1"] = end_mte1_p
+            l0_slots_p[slot_l0_p] = end_mte1_p
+
+            # V加载是否使用L2缓存
+            use_l2_for_v = self.is_l2cache and (q_idx > 0)
+
+            # DN模式: V使用MTE2A路径；标准模式: V使用MTE2B路径
             if self.use_dn:
-                l1_name_v = "L1A"
-                l0_name_v = "L0A"
+                l1_name_v = "MTE2A"
+                l0_name_v = "MTE1A"
                 l1_slots_v = map_k['l1_slots']
                 l0_slots_v = map_k['l0_slots']
             else:
-                l1_name_v = "L1B"
-                l0_name_v = "L0B"
+                l1_name_v = "MTE2B"
+                l0_name_v = "MTE1B"
                 l1_slots_v = map_k['l1_slots']
                 l0_slots_v = map_k['l0_slots']
 
@@ -1176,15 +1385,22 @@ class C1Modeler:
                     actual_n = min(sub_n_c2, self.d_base - i * sub_n_c2)
                     size_v_sub = self.s2_base * actual_n * self._get_kv_element_size()
 
-                    # MTE2 V_sub[i]: load sub-tile to L1
-                    dur_v_sub_l1 = self._calc_mte2_cycles(size_v_sub, use_l2=False)
-                    start_l1_v_sub = max(resource_free_time["MTE2"], l1_slots_v[slot_l1_v], end_vector_v1)
-                    end_l1_v_sub = start_l1_v_sub + dur_v_sub_l1
-                    self.timeline.append(TimelineEvent(
-                        "MTE2", f"Load {l1_name_v} (V{k_idx+1}_sub{i})",
-                        start_l1_v_sub, end_l1_v_sub, dur_v_sub_l1, l1_name_v, q_idx, k_idx
-                    ))
-                    resource_free_time["MTE2"] = end_l1_v_sub
+                    # MTE2 V_sub[i]: load sub-tile to L1 (with L1 cache check)
+                    block_id_v_sub = f"V{k_idx}_sub{i}"
+                    cached_v_sub = l1_cache.check_v(block_id_v_sub)
+                    if cached_v_sub is not None:
+                        end_l1_v_sub = cached_v_sub
+                    else:
+                        dur_v_sub_l1 = self._calc_mte2_cycles(size_v_sub, use_l2=use_l2_for_v)
+                        start_l1_v_sub = max(resource_free_time["MTE2"], l1_slots_v[slot_l1_v], end_vector_v1)
+                        end_l1_v_sub = start_l1_v_sub + dur_v_sub_l1
+                        self.timeline.append(TimelineEvent(
+                            "MTE2", f"Load {l1_name_v} (V{k_idx+1}_sub{i})",
+                            start_l1_v_sub, end_l1_v_sub, dur_v_sub_l1, l1_name_v,
+                            q_idx, k_idx, is_l2_hit=use_l2_for_v
+                        ))
+                        resource_free_time["MTE2"] = end_l1_v_sub
+                        l1_cache.store_v(block_id_v_sub, size_v_sub, end_l1_v_sub)
 
                     # MTE1 V_sub[i]: move sub-tile from L1 to L0
                     dur_v_sub_l0 = self._calc_mte1_cycles(size_v_sub)
@@ -1200,7 +1416,7 @@ class C1Modeler:
 
                     dur_mac_sub = self._calc_mac_cycles_c2(self.s1_base, actual_n, self.s2_base)
                     if i == 0:
-                        start_mac_sub = max(resource_free_time["MAC"], end_mte3, end_l0_v_sub)
+                        start_mac_sub = max(resource_free_time["MAC"], end_mte1_p, end_l0_v_sub)
                     else:
                         # Next sub-MAC can start after previous FIXPIPE completes
                         start_mac_sub = max(resource_free_time["MAC"], end_fix_o, end_l0_v_sub)
@@ -1227,15 +1443,23 @@ class C1Modeler:
 
             else:
                 # For 'K' and 'full': monolithic V load before MAC
+                # For 'K' and 'full': monolithic V load before MAC (with L1 cache check)
                 size_v_l1 = self._calc_v_size()
-                dur_v_l1 = self._calc_mte2_cycles(size_v_l1, use_l2=False)
-                start_l1_v = max(resource_free_time["MTE2"], l1_slots_v[slot_l1_v], end_vector_v1)
-                end_l1_v = start_l1_v + dur_v_l1
-                self.timeline.append(TimelineEvent(
-                    "MTE2", f"Load {l1_name_v} (V{k_idx+1})",
-                    start_l1_v, end_l1_v, dur_v_l1, l1_name_v, q_idx, k_idx
-                ))
-                resource_free_time["MTE2"] = end_l1_v
+                block_id_v = f"V{k_idx}"
+                cached_v = l1_cache.check_v(block_id_v)
+                if cached_v is not None:
+                    end_l1_v = cached_v
+                else:
+                    dur_v_l1 = self._calc_mte2_cycles(size_v_l1, use_l2=use_l2_for_v)
+                    start_l1_v = max(resource_free_time["MTE2"], l1_slots_v[slot_l1_v], end_vector_v1)
+                    end_l1_v = start_l1_v + dur_v_l1
+                    self.timeline.append(TimelineEvent(
+                        "MTE2", f"Load {l1_name_v} (V{k_idx+1})",
+                        start_l1_v, end_l1_v, dur_v_l1, l1_name_v,
+                        q_idx, k_idx, is_l2_hit=use_l2_for_v
+                    ))
+                    resource_free_time["MTE2"] = end_l1_v
+                    l1_cache.store_v(block_id_v, size_v_l1, end_l1_v)
 
                 # H. V矩阵搬运到L0 (MTE1)
                 size_v_l0 = size_v_l1
@@ -1257,7 +1481,7 @@ class C1Modeler:
                         actual_k = min(sub_k, self.s2_base - i * sub_k)
                         dur_mac_sub = self._calc_mac_cycles_c2(self.s1_base, self.d_base, actual_k)
                         if i == 0:
-                            start_mac_sub = max(resource_free_time["MAC"], end_mte3, end_l0_v)
+                            start_mac_sub = max(resource_free_time["MAC"], end_mte1_p, end_l0_v)
                         else:
                             start_mac_sub = resource_free_time["MAC"]
                         end_mac_sub = start_mac_sub + dur_mac_sub
@@ -1284,8 +1508,8 @@ class C1Modeler:
                     dur_mac_c2 = self._calc_mac_cycles_c2(self.s1_base, self.d_base, self.s2_base)
                     start_mac_c2 = max(
                         resource_free_time["MAC"],
-                        end_mte3,  # P已搬回CUBE
-                        end_l0_v   # V已在L0
+                        end_mte1_p,  # P已搬到L0
+                        end_l0_v     # V已在L0
                     )
                     end_mac_c2 = start_mac_c2 + dur_mac_c2
                     self.timeline.append(TimelineEvent(
@@ -1319,8 +1543,8 @@ class C1Modeler:
             resource_free_time["VECTOR_V2"] = end_vector_v2
 
     def _process_n_buffer_group(
-        self, q_idx: int, k_group: list, map_k: Dict,
-        resource_free_time: Dict, q_l0_ready_times: Dict
+        self, q_idx: int, k_group: list, map_q: Dict, map_k: Dict,
+        resource_free_time: Dict, q_l0_ready_times: Dict, l1_cache: L1CacheTracker
     ):
         """
         N_BUFFER 组内按阶段批次执行：
@@ -1334,13 +1558,21 @@ class C1Modeler:
         l1_slots_k = map_k['l1_slots']
         l0_slots_k = map_k['l0_slots']
 
-        # Determine V path
+        # Determine V path (same as K path)
         if self.use_dn:
-            l1_name_v, l0_name_v = "L1A", "L0A"
+            l1_name_v, l0_name_v = "MTE2A", "MTE1A"
         else:
-            l1_name_v, l0_name_v = "L1B", "L0B"
+            l1_name_v, l0_name_v = "MTE2B", "MTE1B"
         l1_slots_v = map_k['l1_slots']
         l0_slots_v = map_k['l0_slots']
+
+        # P path (same as Q path)
+        l1_name_p = map_q['l1']
+        l0_name_p = map_q['l0']
+        l0_slots_p = map_q['l0_slots']
+
+        # V加载是否使用L2缓存
+        use_l2_for_v = self.is_l2cache and (q_idx > 0)
 
         fixpipe_p_ready = {}   # k_idx → FIXPIPE P end time
         v1_ready = {}          # k_idx → VECTOR_V1 end time
@@ -1363,16 +1595,12 @@ class C1Modeler:
                     actual_n = min(sub_n, self.s2_base - i * sub_n)
                     size_k_sub = actual_n * self.d_base * self._get_kv_element_size()
 
-                    # MTE2 K_sub[i]: load sub-tile to L1
-                    dur_k_sub_l1 = self._calc_mte2_cycles(size_k_sub, use_l2=use_l2_for_k)
-                    start_l1_k_sub = max(resource_free_time["MTE2"], l1_slots_k[slot_l1_k])
-                    end_l1_k_sub = start_l1_k_sub + dur_k_sub_l1
-                    self.timeline.append(TimelineEvent(
-                        "MTE2", f"Load {l1_name_k} (K{k_idx+1}_sub{i})",
-                        start_l1_k_sub, end_l1_k_sub, dur_k_sub_l1, l1_name_k,
-                        q_idx, k_idx, is_l2_hit=use_l2_for_k
-                    ))
-                    resource_free_time["MTE2"] = end_l1_k_sub
+                    # MTE2 K_sub[i]: load sub-tile to L1 (with L1 cache check)
+                    end_l1_k_sub = self._mte2_to_l1(
+                        f"K{k_idx}_sub{i}", size_k_sub, use_l2_for_k,
+                        l1_name_k, l1_slots_k, slot_l1_k, resource_free_time, q_idx, k_idx,
+                        f"Load {l1_name_k} (K{k_idx+1}_sub{i})", l1_cache, 'k'
+                    )
 
                     # MTE1 K_sub[i]: move sub-tile from L1 to L0B
                     dur_k_sub_l0 = self._calc_mte1_cycles(size_k_sub)
@@ -1422,15 +1650,11 @@ class C1Modeler:
             else:
                 # For 'K' and 'full': monolithic K load before MAC
                 size_k = self._calc_k_size()
-                dur_k_l1 = self._calc_mte2_cycles(size_k, use_l2=use_l2_for_k)
-                start_l1_k = max(resource_free_time["MTE2"], l1_slots_k[slot_l1_k])
-                end_l1_k = start_l1_k + dur_k_l1
-                self.timeline.append(TimelineEvent(
-                    "MTE2", f"Load {l1_name_k} (K{k_idx+1})",
-                    start_l1_k, end_l1_k, dur_k_l1, l1_name_k,
-                    q_idx, k_idx, is_l2_hit=use_l2_for_k
-                ))
-                resource_free_time["MTE2"] = end_l1_k
+                end_l1_k = self._mte2_to_l1(
+                    f"K{k_idx}", size_k, use_l2_for_k,
+                    l1_name_k, l1_slots_k, slot_l1_k, resource_free_time, q_idx, k_idx,
+                    f"Load {l1_name_k} (K{k_idx+1})", l1_cache, 'k'
+                )
 
                 dur_k_l0 = self._calc_mte1_cycles(size_k)
                 start_l0_k = max(resource_free_time["MTE1"], end_l1_k, l0_slots_k[slot_l0_k])
@@ -1518,9 +1742,23 @@ class C1Modeler:
             end_mte3 = start_mte3 + dur_mte3
             self.timeline.append(TimelineEvent(
                 "MTE3", "P", start_mte3, end_mte3, dur_mte3,
-                "CUBE", q_idx, k_idx
+                l1_name_p, q_idx, k_idx
             ))
             resource_free_time["MTE3"] = end_mte3
+            l1_cache.store_p(f"P{q_idx}_{k_idx}", size_p_mte3, end_mte3)
+
+            # MTE1 (P: L1 → L0)
+            size_p_mte1 = size_p_mte3
+            dur_mte1_p = self._calc_mte1_cycles(size_p_mte1)
+            slot_l0_p = k_idx % len(l0_slots_p)
+            start_mte1_p = max(resource_free_time["MTE1"], end_mte3, l0_slots_p[slot_l0_p])
+            end_mte1_p = start_mte1_p + dur_mte1_p
+            self.timeline.append(TimelineEvent(
+                "MTE1", f"Load {l0_name_p} (P{q_idx+1}{k_idx+1})",
+                start_mte1_p, end_mte1_p, dur_mte1_p, l0_name_p, q_idx, k_idx
+            ))
+            resource_free_time["MTE1"] = end_mte1_p
+            l0_slots_p[slot_l0_p] = end_mte1_p
 
             split_type_nb_c2, sub_count_nb_c2 = self._get_c2_split()
             slot_l1_v = k_idx % len(l1_slots_v)
@@ -1536,15 +1774,22 @@ class C1Modeler:
                     actual_n = min(sub_n_c2, self.d_base - i * sub_n_c2)
                     size_v_sub = self.s2_base * actual_n * self._get_kv_element_size()
 
-                    # MTE2 V_sub[i]: load sub-tile to L1
-                    dur_v_sub_l1 = self._calc_mte2_cycles(size_v_sub, use_l2=False)
-                    start_l1_v_sub = max(resource_free_time["MTE2"], l1_slots_v[slot_l1_v], p_ready)
-                    end_l1_v_sub = start_l1_v_sub + dur_v_sub_l1
-                    self.timeline.append(TimelineEvent(
-                        "MTE2", f"Load {l1_name_v} (V{k_idx+1}_sub{i})",
-                        start_l1_v_sub, end_l1_v_sub, dur_v_sub_l1, l1_name_v, q_idx, k_idx
-                    ))
-                    resource_free_time["MTE2"] = end_l1_v_sub
+                    # MTE2 V_sub[i]: load sub-tile to L1 (with L1 cache check)
+                    block_id_v_sub = f"V{k_idx}_sub{i}"
+                    cached_v_sub = l1_cache.check_v(block_id_v_sub)
+                    if cached_v_sub is not None:
+                        end_l1_v_sub = cached_v_sub
+                    else:
+                        dur_v_sub_l1 = self._calc_mte2_cycles(size_v_sub, use_l2=use_l2_for_v)
+                        start_l1_v_sub = max(resource_free_time["MTE2"], l1_slots_v[slot_l1_v], p_ready)
+                        end_l1_v_sub = start_l1_v_sub + dur_v_sub_l1
+                        self.timeline.append(TimelineEvent(
+                            "MTE2", f"Load {l1_name_v} (V{k_idx+1}_sub{i})",
+                            start_l1_v_sub, end_l1_v_sub, dur_v_sub_l1, l1_name_v,
+                            q_idx, k_idx, is_l2_hit=use_l2_for_v
+                        ))
+                        resource_free_time["MTE2"] = end_l1_v_sub
+                        l1_cache.store_v(block_id_v_sub, size_v_sub, end_l1_v_sub)
 
                     # MTE1 V_sub[i]: move sub-tile from L1 to L0
                     dur_v_sub_l0 = self._calc_mte1_cycles(size_v_sub)
@@ -1560,7 +1805,7 @@ class C1Modeler:
 
                     dur_mac_sub = self._calc_mac_cycles_c2(self.s1_base, actual_n, self.s2_base)
                     if i == 0:
-                        start_mac_sub = max(resource_free_time["MAC"], end_mte3, end_l0_v_sub)
+                        start_mac_sub = max(resource_free_time["MAC"], end_mte1_p, end_l0_v_sub)
                     else:
                         # Next sub-MAC can start after previous FIXPIPE completes
                         start_mac_sub = max(resource_free_time["MAC"], end_fix_o, end_l0_v_sub)
@@ -1588,15 +1833,23 @@ class C1Modeler:
 
             else:
                 # For 'K' and 'full': monolithic V load before MAC
+                # For 'K' and 'full': monolithic V load before MAC (with L1 cache check)
                 size_v = self._calc_v_size()
-                dur_v_l1 = self._calc_mte2_cycles(size_v, use_l2=False)
-                start_l1_v = max(resource_free_time["MTE2"], l1_slots_v[slot_l1_v], p_ready)
-                end_l1_v = start_l1_v + dur_v_l1
-                self.timeline.append(TimelineEvent(
-                    "MTE2", f"Load {l1_name_v} (V{k_idx+1})",
-                    start_l1_v, end_l1_v, dur_v_l1, l1_name_v, q_idx, k_idx
-                ))
-                resource_free_time["MTE2"] = end_l1_v
+                block_id_v = f"V{k_idx}"
+                cached_v = l1_cache.check_v(block_id_v)
+                if cached_v is not None:
+                    end_l1_v = cached_v
+                else:
+                    dur_v_l1 = self._calc_mte2_cycles(size_v, use_l2=use_l2_for_v)
+                    start_l1_v = max(resource_free_time["MTE2"], l1_slots_v[slot_l1_v], p_ready)
+                    end_l1_v = start_l1_v + dur_v_l1
+                    self.timeline.append(TimelineEvent(
+                        "MTE2", f"Load {l1_name_v} (V{k_idx+1})",
+                        start_l1_v, end_l1_v, dur_v_l1, l1_name_v,
+                        q_idx, k_idx, is_l2_hit=use_l2_for_v
+                    ))
+                    resource_free_time["MTE2"] = end_l1_v
+                    l1_cache.store_v(block_id_v, size_v, end_l1_v)
 
                 dur_v_l0 = self._calc_mte1_cycles(size_v)
                 start_l0_v = max(resource_free_time["MTE1"], end_l1_v, l0_slots_v[slot_l0_v])
@@ -1615,7 +1868,7 @@ class C1Modeler:
                         actual_k = min(sub_k, self.s2_base - i * sub_k)
                         dur_mac_sub = self._calc_mac_cycles_c2(self.s1_base, self.d_base, actual_k)
                         if i == 0:
-                            start_mac_sub = max(resource_free_time["MAC"], end_mte3, end_l0_v)
+                            start_mac_sub = max(resource_free_time["MAC"], end_mte1_p, end_l0_v)
                         else:
                             start_mac_sub = resource_free_time["MAC"]
                         end_mac_sub = start_mac_sub + dur_mac_sub
@@ -1641,7 +1894,7 @@ class C1Modeler:
                 else:
                     # matmulFull
                     dur_mac_c2 = self._calc_mac_cycles_c2(self.s1_base, self.d_base, self.s2_base)
-                    start_mac_c2 = max(resource_free_time["MAC"], end_mte3, end_l0_v)
+                    start_mac_c2 = max(resource_free_time["MAC"], end_mte1_p, end_l0_v)
                     end_mac_c2 = start_mac_c2 + dur_mac_c2
                     self.timeline.append(TimelineEvent(
                         "MAC", "O", start_mac_c2, end_mac_c2, dur_mac_c2,
