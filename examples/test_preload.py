@@ -38,7 +38,7 @@ modeler = C1Modeler(
 
 timeline, _, unit_times, total_cycles = modeler.run_simulation()
 modeler.print_performance(unit_times, total_cycles)
-modeler.plot_timeline(timeline, unit_times, total_cycles, "preload_0_timeline.png")
+modeler.plot_timeline(timeline, unit_times, total_cycles, "outputs/preload_0_timeline.png")
 
 print("\n事件序列 (前20个):")
 print("-" * 80)
@@ -86,7 +86,7 @@ modeler2 = C1Modeler(
 
 timeline2, _, unit_times2, total_cycles2 = modeler2.run_simulation()
 modeler2.print_performance(unit_times2, total_cycles2)
-modeler2.plot_timeline(timeline2, unit_times2, total_cycles2, "preload_1_timeline.png")
+modeler2.plot_timeline(timeline2, unit_times2, total_cycles2, "outputs/preload_1_timeline.png")
 
 print("\n事件序列 (前24个):")
 print("-" * 80)
@@ -134,7 +134,7 @@ modeler3 = C1Modeler(
 
 timeline3, _, unit_times3, total_cycles3 = modeler3.run_simulation()
 modeler3.print_performance(unit_times3, total_cycles3)
-modeler3.plot_timeline(timeline3, unit_times3, total_cycles3, "preload_1_twobuffer_timeline.png")
+modeler3.plot_timeline(timeline3, unit_times3, total_cycles3, "outputs/preload_1_twobuffer_timeline.png")
 
 print("\n事件序列 (前24个):")
 print("-" * 80)
@@ -165,6 +165,6 @@ print("1. PRELOAD模式时，每个k block的V在K加载完成后立即预加载
 print("2. TWOBUFFER=True时，V使用独立L1 slot，与K的slot无冲突，V可更早开始加载")
 print("3. C2阶段跳过MTE2 V加载步骤，直接MTE1从L1→L0")
 print("\n图表已保存:")
-print("  - preload_0_timeline.png         (DEFAULT顺序流水)")
-print("  - preload_1_timeline.png         (PRELOAD渐进式, TWOBUFFER=False)")
-print("  - preload_1_twobuffer_timeline.png (PRELOAD渐进式, TWOBUFFER=True)")
+print("  - outputs/preload_0_timeline.png         (DEFAULT顺序流水)")
+print("  - outputs/preload_1_timeline.png         (PRELOAD渐进式, TWOBUFFER=False)")
+print("  - outputs/preload_1_twobuffer_timeline.png (PRELOAD渐进式, TWOBUFFER=True)")

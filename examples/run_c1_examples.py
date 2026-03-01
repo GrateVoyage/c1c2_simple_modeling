@@ -32,7 +32,7 @@ def example_standard():
     modeler = C1Modeler(**config.to_dict())
     timeline, bound_type, unit_times, total_cycles = modeler.run_simulation()
     modeler.print_performance(unit_times, total_cycles)
-    modeler.plot_timeline(timeline, unit_times, total_cycles, "standard_timeline.png")
+    modeler.plot_timeline(timeline, unit_times, total_cycles, "outputs/standard_timeline.png")
 
 def example_dn_mode():
     """DN模式示例"""
@@ -54,7 +54,7 @@ def example_dn_mode():
     modeler = C1Modeler(**config.to_dict())
     timeline, bound_type, unit_times, total_cycles = modeler.run_simulation()
     modeler.print_performance(unit_times, total_cycles)
-    modeler.plot_timeline(timeline, unit_times, total_cycles, "dn_mode_timeline.png")
+    modeler.plot_timeline(timeline, unit_times, total_cycles, "outputs/dn_mode_timeline.png")
 
 def example_full_load():
     """Full Load模式示例"""
@@ -76,7 +76,7 @@ def example_full_load():
     modeler = C1Modeler(**config.to_dict())
     timeline, bound_type, unit_times, total_cycles = modeler.run_simulation()
     modeler.print_performance(unit_times, total_cycles)
-    modeler.plot_timeline(timeline, unit_times, total_cycles, "full_load_timeline.png")
+    modeler.plot_timeline(timeline, unit_times, total_cycles, "outputs/full_load_timeline.png")
 
 def example_custom():
     """自定义配置示例"""
@@ -109,7 +109,7 @@ def example_custom():
 
     timeline, bound_type, unit_times, total_cycles = modeler.run_simulation()
     modeler.print_performance(unit_times, total_cycles)
-    modeler.plot_timeline(timeline, unit_times, total_cycles, "custom_timeline.png")
+    modeler.plot_timeline(timeline, unit_times, total_cycles, "outputs/custom_timeline.png")
 
 def example_n_buffer():
     """N_BUFFER流水线模式示例"""
@@ -143,7 +143,7 @@ def example_n_buffer():
 
     timeline, bound_type, unit_times, total_cycles = modeler.run_simulation()
     modeler.print_performance(unit_times, total_cycles)
-    modeler.plot_timeline(timeline, unit_times, total_cycles, "n_buffer_timeline.png")
+    modeler.plot_timeline(timeline, unit_times, total_cycles, "outputs/n_buffer_timeline.png")
 
 def main():
     """运行所有示例"""
