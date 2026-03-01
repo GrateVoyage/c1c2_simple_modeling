@@ -1,6 +1,8 @@
 """
 时间线可视化工具
 """
+import matplotlib
+matplotlib.use('Agg')  # 非交互后端，避免 WSL 环境下 Qt/Wayland 报错
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from typing import List, Dict

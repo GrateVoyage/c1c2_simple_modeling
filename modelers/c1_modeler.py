@@ -206,6 +206,9 @@ class C1Modeler:
         self.L1_db = L1_db
         self.L0_db = L0_db
         self.load_order = load_order
+        # Q_RESIDENT 策略要求 Q 常驻 L1，必须开启 full_load
+        if inner_core_pipeline == InnerCorePipeline.Q_RESIDENT:
+            full_load = True
         self.full_load = full_load
         self.inter_core_pipeline = inter_core_pipeline
         self.inner_core_pipeline = inner_core_pipeline
