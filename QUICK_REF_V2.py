@@ -1,269 +1,169 @@
 """
-完整Flash Attention C1V1C2V2流水线 - 快速参考
+Flash Attention C1V1C2V2 流水线建模 — 快速参考脚本
+
+直接运行此文件可看到各特性的简短演示：
+  python QUICK_REF_V2.py
+
+更完整的示例见 examples/ 目录。
 """
 
-# ============================================================
-# Flash Attention 算子完整流程
-# ============================================================
-
-"""
-C1: Q @ K^T → S (Attention Score) - 第一次矩阵乘法
-V1: Softmax S → P (Attention Probability) - 第一次向量操作
-C2: P @ V → O (Output) - 第二次矩阵乘法
-V2: 后处理 - 第二次向量操作
-"""
-
-# ============================================================
-# 流水线详细步骤
-# ============================================================
-
-"""
-【C1阶段】生成Attention Score矩阵P
-1. MTE2: 加载Q到L1A, K到L1B (DN模式相反)
-2. MTE1: 搬Q到L0A, K到L0B
-3. MAC:  计算 Q @ K^T → P矩阵 (标注: P11, P12...)
-4. FIXPIPE: 搬P到UB
-
-【V1阶段】Softmax处理
-5. VECTOR_V1: Softmax等操作 (800 cycles, 标注: P11)
-
-【转换阶段】准备C2
-6. MTE3: 搬P从UB回到CUBE (256 B/cycle)
-7. MTE2: 并行加载V矩阵到L1B (DN模式为L1A)
-8. MTE1: 搬V到L0B
-
-【C2阶段】生成最终输出O
-9. MAC:  计算 P @ V → O矩阵 (标注: O11, O12...)
-10. FIXPIPE: 搬O到UB
-
-【V2阶段】后处理
-11. VECTOR_V2: 后处理操作 (800 cycles, 标注: O11)
-"""
-
-# ============================================================
-# 硬件单元说明
-# ============================================================
-
-HARDWARE_UNITS = {
-    "MTE2": {
-        "功能": "DRAM/L2 → L1",
-        "带宽_DRAM": "1600 GB/s / 32",
-        "带宽_L2": "5400 GB/s / 32",
-        "用途": "加载Q, K, V矩阵"
-    },
-    "MTE1": {
-        "功能": "L1 → L0",
-        "带宽": "256 bytes/cycle",
-        "用途": "搬运Q, K, V到L0"
-    },
-    "MTE3": {
-        "功能": "UB → CUBE",
-        "带宽": "256 bytes/cycle",
-        "用途": "P矩阵搬回CUBE用于C2"
-    },
-    "MAC": {
-        "功能": "矩阵乘法",
-        "吞吐_FP16": "16*16*16*2",
-        "吞吐_FP8": "16*32*16*2",
-        "用途": "C1: Q@K^T→P, C2: P@V→O"
-    },
-    "FIXPIPE": {
-        "功能": "L0C → UB",
-        "带宽": "256 bytes/cycle",
-        "用途": "搬运P和O矩阵"
-    },
-    "VECTOR_V1": {
-        "功能": "向量操作",
-        "周期": "800 cycles (固定)",
-        "用途": "Softmax等处理P"
-    },
-    "VECTOR_V2": {
-        "功能": "向量操作",
-        "周期": "800 cycles (固定)",
-        "用途": "后处理O"
-    }
-}
-
-# ============================================================
-# DN模式路径映射
-# ============================================================
-
-"""
-标准模式:
-  Q → L1A → L0A
-  K → L1B → L0B
-  V → L1B → L0B (复用K路径)
-
-DN模式:
-  Q → L1B → L0B
-  K → L1A → L0A
-  V → L1A → L0A (复用K路径)
-"""
-
-# ============================================================
-# 可视化Y轴布局
-# ============================================================
-
-Y_AXIS_LAYOUT = """
-从下到上:
-
-VECTOR_V2  ■■■ O11  ■■■ O12  (橙色 #E59866)
-VECTOR_V1  ■■■ P11  ■■■ P12  (黄色 #F7DC6F)
-MTE3       ■ P11 ■ P12        (灰色 #95A5A6)
-FIXPIPE    ■ P11/O11          (绿色 #96CEB4)
-MAC        ■■ P11/O11         (蓝色 #45B7D1)
-L0B        ■ K1/V1            (青色 #4ECDC4)
-L0A        ■ Q1               (青色 #4ECDC4)
-L1B        ■■ K1/V1           (红色/橙色)
-L1A        ■■ Q1              (红色/橙色)
-"""
-
-# ============================================================
-# 标注格式
-# ============================================================
-
-LABEL_FORMAT = {
-    "Q块": "Q1, Q2, Q3...",
-    "K块": "K1, K2, K3...",
-    "V块": "V1, V2, V3...",
-    "P矩阵": "P11, P12, P21, P22... (C1和V1阶段)",
-    "O矩阵": "O11, O12, O21, O22... (C2和V2阶段)",
-}
-
-# ============================================================
-# 使用示例
-# ============================================================
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
 
 from modelers import C1Modeler
-from modelers.templates import StandardConfig
-from core import DataType
+from core import DataType, InterCorePipeline, InnerCorePipeline
 
-# 创建建模器
-modeler = C1Modeler(
-    s1_total=256,
-    s2_total=512,
-    d_total=128,
-    s1_base_size=128,
-    s2_base_size=256,
-    d_base_size=128,
-    data_type=DataType.FP16,
-    use_dn=False,
-    L1_db=True,
-    L0_db=True
-)
+# ──────────────────────────────────────────────────────────────
+# 参数速查
+# ──────────────────────────────────────────────────────────────
+#
+# 矩阵维度
+#   s1_total / s2_total / d_total       — Q/K/d 总长度
+#   s1_base_size / s2_base_size / d_base_size  — 基本块大小
+#
+# 矩阵乘切分（超出 base 上限自动切分）
+#   baseM_C1/baseN_C1/baseK_C1          — C1 (Q@K^T) 切分上限
+#   baseM_C2/baseN_C2/baseK_C2          — C2 (P@V)   切分上限
+#   切分规则:  K 轴超限 → matmulK（L0C 累加，单次 FIXPIPE）
+#              N 轴超限 → matmulN（每子块独立 FIXPIPE）
+#
+# 数据类型
+#   q_data_type  = DataType.FP16 / DataType.FP8   — Q 精度
+#   kv_data_type = DataType.FP16 / DataType.FP8   — K/V 精度
+#   MAC C1 吞吐：q 和 kv 同时 FP8 → FP8 吞吐，否则 FP16
+#   MAC C2 吞吐：由 kv_data_type 决定
+#   FIXPIPE 输出大小恒为 FP32（与数据类型无关）
+#
+# 核间流水（inter_core_pipeline）
+#   DEFAULT   顺序: C1V1C2V2 → C1V1C2V2 → ...
+#   PRELOAD   渐进: V 在 K 加载后立即预取，与 C1/V1 并行
+#             可选 two_buffer=True 让 V 使用独立 L1 slot
+#   N_BUFFER  批次: C1C1 → V1V1 → C2C2 → V2V2 → ...
+#
+# 存储策略
+#   is_l2cache  重复加载同一块用 L2 带宽（否则用 DRAM）
+#   use_dn      DN 模式（Q/K 路径互换）
+#   L1_db       L1 双缓冲
+#   L0_db       L0A/L0B 双缓冲
+#   full_load   仿真开始前 Q 全量加载到 L1
+#
+# ──────────────────────────────────────────────────────────────
 
-# 运行模拟
-timeline, bound_type, unit_times, total_cycles = modeler.run_simulation()
 
-# 输出性能
-modeler.print_performance(unit_times, total_cycles)
+def demo_default():
+    """DEFAULT 顺序流水 — 最基础用法"""
+    modeler = C1Modeler(
+        s1_total=256, s2_total=512, d_total=128,
+        s1_base_size=128, s2_base_size=256, d_base_size=128,
+        baseM_C1=128, baseN_C1=128, baseK_C1=128,
+        baseM_C2=128, baseN_C2=128, baseK_C2=128,
+        q_data_type=DataType.FP16,
+        kv_data_type=DataType.FP16,
+        is_l2cache=True,
+        inter_core_pipeline=InterCorePipeline.DEFAULT,
+        inner_core_pipeline=InnerCorePipeline.DEFAULT,
+    )
+    _, _, unit_times, total_cycles = modeler.run_simulation()
+    print(f"  DEFAULT    总周期: {total_cycles:>10.1f}")
+    return total_cycles
 
-# 生成图表
-modeler.plot_timeline(timeline, unit_times, total_cycles, "output.png")
 
-# ============================================================
-# 性能输出示例
-# ============================================================
+def demo_preload():
+    """PRELOAD 渐进式流水 — V 与 C1/V1 并行"""
+    modeler = C1Modeler(
+        s1_total=256, s2_total=512, d_total=128,
+        s1_base_size=128, s2_base_size=256, d_base_size=128,
+        baseM_C1=128, baseN_C1=128, baseK_C1=128,
+        baseM_C2=128, baseN_C2=128, baseK_C2=128,
+        q_data_type=DataType.FP16,
+        kv_data_type=DataType.FP16,
+        is_l2cache=True,
+        inter_core_pipeline=InterCorePipeline.PRELOAD,
+        inner_core_pipeline=InnerCorePipeline.DEFAULT,
+        two_buffer=False,
+    )
+    _, _, unit_times, total_cycles = modeler.run_simulation()
+    print(f"  PRELOAD    总周期: {total_cycles:>10.1f}")
+    return total_cycles
 
-"""
-=== 性能分析 ===
-总周期数: 29679.4
 
-MTE2       总耗时: 18127.4  (利用率: 61.1%) ← 瓶颈
-MTE1       总耗时: 2304.0   (利用率: 7.8%)
-MTE3       总耗时: 1024.0   (利用率: 3.5%)  ← 新增
-MAC        总耗时: 8192.0   (利用率: 27.6%)
-FIXPIPE    总耗时: 1536.0   (利用率: 5.2%)
-VECTOR_V1  总耗时: 3200.0   (利用率: 10.8%) ← V1阶段
-VECTOR_V2  总耗时: 3200.0   (利用率: 10.8%) ← V2阶段
+def demo_n_buffer():
+    """N_BUFFER 批次流水 — C1C1→V1V1→C2C2→V2V2"""
+    modeler = C1Modeler(
+        s1_total=256, s2_total=512, d_total=128,
+        s1_base_size=128, s2_base_size=256, d_base_size=128,
+        baseM_C1=128, baseN_C1=128, baseK_C1=128,
+        baseM_C2=128, baseN_C2=128, baseK_C2=128,
+        q_data_type=DataType.FP16,
+        kv_data_type=DataType.FP16,
+        is_l2cache=True,
+        inter_core_pipeline=InterCorePipeline.N_BUFFER,
+        inner_core_pipeline=InnerCorePipeline.DEFAULT,
+    )
+    _, _, unit_times, total_cycles = modeler.run_simulation()
+    print(f"  N_BUFFER   总周期: {total_cycles:>10.1f}")
+    return total_cycles
 
-瓶颈分析: MTE2
-"""
 
-# ============================================================
-# 关键事件流
-# ============================================================
+def demo_fp8():
+    """FP8 数据类型 — 更高 MAC 吞吐"""
+    modeler = C1Modeler(
+        s1_total=256, s2_total=512, d_total=128,
+        s1_base_size=128, s2_base_size=256, d_base_size=128,
+        baseM_C1=128, baseN_C1=128, baseK_C1=128,
+        baseM_C2=128, baseN_C2=128, baseK_C2=128,
+        q_data_type=DataType.FP8,
+        kv_data_type=DataType.FP8,
+        is_l2cache=True,
+        inter_core_pipeline=InterCorePipeline.DEFAULT,
+        inner_core_pipeline=InnerCorePipeline.DEFAULT,
+    )
+    _, _, unit_times, total_cycles = modeler.run_simulation()
+    print(f"  FP8+FP8    总周期: {total_cycles:>10.1f}")
+    return total_cycles
 
-EVENT_FLOW_EXAMPLE = """
-事件序列 (Q1K1为例):
 
-C1阶段:
-  MTE2  Load L1A (Q1)    ← 加载Q
-  MTE2  Load L1B (K1)    ← 加载K
-  MTE1  Load L0A (Q1)    ← Q到L0
-  MTE1  Load L0B (K1)    ← K到L0
-  MAC   P      P11       ← 矩阵乘 Q@K^T
-  FIXPIPE P    P11       ← P到UB
+def demo_matmul_split():
+    """矩阵乘切分 — d_base > baseK_C1 触发 matmulK"""
+    modeler = C1Modeler(
+        s1_total=128, s2_total=128, d_total=256,
+        s1_base_size=128, s2_base_size=128, d_base_size=256,
+        baseM_C1=128, baseN_C1=128, baseK_C1=128,   # d_base(256) > baseK_C1(128) → matmulK
+        baseM_C2=128, baseN_C2=128, baseK_C2=128,
+        q_data_type=DataType.FP16,
+        kv_data_type=DataType.FP16,
+        inter_core_pipeline=InterCorePipeline.DEFAULT,
+        inner_core_pipeline=InnerCorePipeline.DEFAULT,
+    )
+    timeline, _, unit_times, total_cycles = modeler.run_simulation()
+    mac_p = [e for e in timeline if e.unit == "MAC" and e.operation == "P"]
+    fix_p = [e for e in timeline if e.unit == "FIXPIPE" and e.operation == "P"]
+    print(f"  matmulK    MAC×{len(mac_p)} FIXPIPE×{len(fix_p)}  总周期: {total_cycles:>10.1f}")
+    return total_cycles
 
-V1阶段:
-  VECTOR_V1 P  P11       ← Softmax处理
 
-转换阶段:
-  MTE3  P      P11       ← P回CUBE
-  MTE2  Load L1B (V1)    ← 加载V (并行)
-  MTE1  Load L0B (V1)    ← V到L0
+if __name__ == "__main__":
+    print("=" * 50)
+    print("Flash Attention C1V1C2V2 — 快速特性演示")
+    print("=" * 50)
 
-C2阶段:
-  MAC   O      O11       ← 矩阵乘 P@V
-  FIXPIPE O    O11       ← O到UB
+    print("\n【核间流水对比】")
+    c_default = demo_default()
+    c_preload  = demo_preload()
+    c_nbuffer  = demo_n_buffer()
+    print(f"\n  PRELOAD vs DEFAULT:  {(c_default - c_preload) / c_default * 100:+.1f}%")
+    print(f"  N_BUFFER vs DEFAULT: {(c_default - c_nbuffer) / c_default * 100:+.1f}%")
 
-V2阶段:
-  VECTOR_V2 O  O11       ← 后处理
-"""
+    print("\n【数据类型对比】")
+    demo_default()          # FP16+FP16（复用上方结果展示）
+    demo_fp8()
 
-# ============================================================
-# 测试命令
-# ============================================================
+    print("\n【矩阵乘切分】")
+    demo_matmul_split()
 
-"""
-# 运行完整流水线测试
-python examples/test_full_pipeline.py
-
-# 运行所有配置示例
-python examples/run_c1_examples.py
-
-# 向后兼容测试
-python single_mm_modeling.py
-"""
-
-# ============================================================
-# 性能优化建议
-# ============================================================
-
-OPTIMIZATION_TIPS = """
-1. MTE2瓶颈 (最常见):
-   - 启用L2缓存: is_l2cache=True
-   - 增加块大小以提高计算强度
-   - 考虑Full Load预加载Q
-
-2. MAC瓶颈:
-   - 检查矩阵维度是否合理
-   - 考虑使用FP8提高吞吐
-
-3. VECTOR瓶颈:
-   - 检查Vector操作周期数设置
-   - 优化Softmax实现
-
-4. 流水线优化:
-   - 启用L1和L0双缓冲
-   - 利用DN模式提高并行度
-"""
-
-# ============================================================
-# 文件说明
-# ============================================================
-
-FILES = {
-    "README.md": "项目说明文档",
-    "CHANGELOG_V2.md": "C1V1C2V2更新日志",
-    "QUICK_REF_V2.py": "本文档 - 完整流水线参考",
-
-    "examples/test_full_pipeline.py": "完整流水线测试",
-    "examples/run_c1_examples.py": "配置示例集",
-
-    "modelers/c1_modeler.py": "主建模器实现",
-    "modelers/templates/": "配置模板",
-
-    "utils/visualizer.py": "可视化工具",
-    "core/": "核心定义"
-}
+    print("\n更多示例:")
+    print("  python examples/run_c1_examples.py      # 各配置+时间线图")
+    print("  python examples/test_full_pipeline.py   # 完整流水线事件流")
+    print("  python examples/test_preload.py         # PRELOAD / TWOBUFFER 对比")
+    print("  python -m pytest tests/ -q              # 运行全部测试")
