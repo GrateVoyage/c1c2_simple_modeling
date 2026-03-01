@@ -1992,4 +1992,9 @@ class C1Modeler:
 
     def print_performance(self, unit_times: Dict, total_cycles: float):
         """打印性能分析"""
+        c1_type, c1_count = self._get_c1_split()
+        c2_type, c2_count = self._get_c2_split()
+        c1_label = f"matmul{c1_type}" if c1_type != 'full' else "matmulFull"
+        c2_label = f"matmul{c2_type}" if c2_type != 'full' else "matmulFull"
+        print(f"C1 模板: {c1_label} (sub_count={c1_count})  |  C2 模板: {c2_label} (sub_count={c2_count})")
         TimelineVisualizer.print_performance(unit_times, total_cycles)
