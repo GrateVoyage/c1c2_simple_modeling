@@ -342,7 +342,7 @@ class C1Modeler:
               f"流水线={self.inter_core_pipeline.value}")
 
         self.timeline.clear()
-        resource_free_time = {"MTE2": 0.0, "MTE1": 0.0, "MAC": 0.0, "FIXPIPE": 0.0, "MTE3": 0.0, "VECTOR_V1": 0.0, "VECTOR_V2": 0.0}
+        resource_free_time = {"MTE2": 0.0, "MTE1": 0.0, "MAC": 0.0, "FIXPIPE": 0.0, "MTE3": 0.0, "VECTOR": 0.0}
 
         # L1缓存追踪器
         l1_cache = L1CacheTracker(self.hw_config.L1_CAPACITY, self.inner_core_pipeline)
@@ -752,14 +752,14 @@ class C1Modeler:
 
         # E. VECTOR_V1 (Softmax等操作)
         dur_vector_v1 = self._calc_vector_v1_cycles()
-        start_vector_v1 = max(resource_free_time["VECTOR_V1"], end_fix_p)
+        start_vector_v1 = max(resource_free_time["VECTOR"], end_fix_p)
         end_vector_v1 = start_vector_v1 + dur_vector_v1
 
         self.timeline.append(TimelineEvent(
             "VECTOR_V1", "P", start_vector_v1, end_vector_v1, dur_vector_v1,
             "CUBE", q_idx, k_idx
         ))
-        resource_free_time["VECTOR_V1"] = end_vector_v1
+        resource_free_time["VECTOR"] = end_vector_v1
 
         # 返回P矩阵就绪时间（用于C2阶段）
         return end_vector_v1
@@ -935,10 +935,10 @@ class C1Modeler:
     ) -> float:
         """发射VECTOR_V1事件，返回end_vector_v1"""
         dur = self._calc_vector_v1_cycles()
-        start = max(resource_free_time["VECTOR_V1"], end_fix_p)
+        start = max(resource_free_time["VECTOR"], end_fix_p)
         end = start + dur
         self.timeline.append(TimelineEvent("VECTOR_V1", "P", start, end, dur, "CUBE", q_idx, k_idx))
-        resource_free_time["VECTOR_V1"] = end
+        resource_free_time["VECTOR"] = end
         return end
 
     def _process_c2_stage(
@@ -1165,14 +1165,14 @@ class C1Modeler:
 
         # K. VECTOR_V2 (后处理操作)
         dur_vector_v2 = self._calc_vector_v2_cycles()
-        start_vector_v2 = max(resource_free_time["VECTOR_V2"], end_fix_o)
+        start_vector_v2 = max(resource_free_time["VECTOR"], end_fix_o)
         end_vector_v2 = start_vector_v2 + dur_vector_v2
 
         self.timeline.append(TimelineEvent(
             "VECTOR_V2", "O", start_vector_v2, end_vector_v2, dur_vector_v2,
             "CUBE", q_idx, k_idx
         ))
-        resource_free_time["VECTOR_V2"] = end_vector_v2
+        resource_free_time["VECTOR"] = end_vector_v2
 
     def _process_k_blocks(
         self, q_idx: int, map_q: Dict, map_k: Dict, resource_free_time: Dict,
@@ -1351,14 +1351,14 @@ class C1Modeler:
 
             # E. VECTOR_V1 (Softmax等操作)
             dur_vector_v1 = self._calc_vector_v1_cycles()
-            start_vector_v1 = max(resource_free_time["VECTOR_V1"], end_fix_p)
+            start_vector_v1 = max(resource_free_time["VECTOR"], end_fix_p)
             end_vector_v1 = start_vector_v1 + dur_vector_v1
 
             self.timeline.append(TimelineEvent(
                 "VECTOR_V1", "P", start_vector_v1, end_vector_v1, dur_vector_v1,
                 "CUBE", q_idx, k_idx
             ))
-            resource_free_time["VECTOR_V1"] = end_vector_v1
+            resource_free_time["VECTOR"] = end_vector_v1
 
             # === 准备C2阶段 ===
 
@@ -1564,14 +1564,14 @@ class C1Modeler:
 
             # K. VECTOR_V2 (后处理操作)
             dur_vector_v2 = self._calc_vector_v2_cycles()
-            start_vector_v2 = max(resource_free_time["VECTOR_V2"], end_fix_o)
+            start_vector_v2 = max(resource_free_time["VECTOR"], end_fix_o)
             end_vector_v2 = start_vector_v2 + dur_vector_v2
 
             self.timeline.append(TimelineEvent(
                 "VECTOR_V2", "O", start_vector_v2, end_vector_v2, dur_vector_v2,
                 "CUBE", q_idx, k_idx
             ))
-            resource_free_time["VECTOR_V2"] = end_vector_v2
+            resource_free_time["VECTOR"] = end_vector_v2
 
     def _process_n_buffer_group(
         self, q_idx: int, k_group: list, map_q: Dict, map_k: Dict,
@@ -1766,13 +1766,13 @@ class C1Modeler:
         # Note: V1[k0] can overlap with MAC C1[k1] (different hardware)
         for k_idx in k_group:
             dur_v1 = self._calc_vector_v1_cycles()
-            start_v1 = max(resource_free_time["VECTOR_V1"], fixpipe_p_ready[k_idx])
+            start_v1 = max(resource_free_time["VECTOR"], fixpipe_p_ready[k_idx])
             end_v1 = start_v1 + dur_v1
             self.timeline.append(TimelineEvent(
                 "VECTOR_V1", "P", start_v1, end_v1, dur_v1,
                 "CUBE", q_idx, k_idx
             ))
-            resource_free_time["VECTOR_V1"] = end_v1
+            resource_free_time["VECTOR"] = end_v1
             v1_ready[k_idx] = end_v1
 
         # ── Phase 3: C2 for all k in group ──────────────────────────────
@@ -1967,13 +1967,13 @@ class C1Modeler:
         # ── Phase 4: V2 for all k in group ──────────────────────────────
         for k_idx in k_group:
             dur_v2 = self._calc_vector_v2_cycles()
-            start_v2 = max(resource_free_time["VECTOR_V2"], fixpipe_o_ready[k_idx])
+            start_v2 = max(resource_free_time["VECTOR"], fixpipe_o_ready[k_idx])
             end_v2 = start_v2 + dur_v2
             self.timeline.append(TimelineEvent(
                 "VECTOR_V2", "O", start_v2, end_v2, dur_v2,
                 "CUBE", q_idx, k_idx
             ))
-            resource_free_time["VECTOR_V2"] = end_v2
+            resource_free_time["VECTOR"] = end_v2
 
     def plot_timeline(self, timeline: List[TimelineEvent], unit_times: Dict,
                      total_cycles: float, filename: str = "timeline.png"):
