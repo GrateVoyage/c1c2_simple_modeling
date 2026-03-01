@@ -780,23 +780,23 @@ class C1Modeler:
         if split_type == 'N':
             sub_n = self.baseN_C1
             last_mac_end_c1 = 0.0
-            end_l0_k = 0.0
-            end_fix_p = 0.0
+            # ONE MTE2 for full K block
+            size_k_full = self._calc_k_size()
+            end_l1_k = self._mte2_to_l1(
+                f"K{k_idx}", size_k_full, use_l2_for_k,
+                l1_name_k, l1_slots_k, slot_l1_k, resource_free_time, q_idx, k_idx,
+                f"Load {l1_name_k} (K{k_idx+1})", l1_cache, 'k'
+            )
             for i in range(sub_count):
                 actual_n = min(sub_n, self.s2_base - i * sub_n)
                 size_k_sub = actual_n * self.d_base * self._get_kv_element_size()
-
-                end_l1_k_sub = self._mte2_to_l1(
-                    f"K{k_idx}_sub{i}", size_k_sub, use_l2_for_k,
-                    l1_name_k, l1_slots_k, slot_l1_k, resource_free_time, q_idx, k_idx,
-                    f"Load {l1_name_k} (K{k_idx+1}_sub{i})", l1_cache, 'k'
-                )
+                sub_slot = i % len(l0_slots_k)
 
                 dur_k_sub_l0 = self._calc_mte1_cycles(size_k_sub)
                 start_l0_k_sub = max(
                     resource_free_time["MTE1"],
-                    end_l1_k_sub,
-                    l0_slots_k[slot_l0_k]
+                    end_l1_k,
+                    l0_slots_k[sub_slot]
                 )
                 end_l0_k_sub = start_l0_k_sub + dur_k_sub_l0
                 self.timeline.append(TimelineEvent(
@@ -804,8 +804,6 @@ class C1Modeler:
                     start_l0_k_sub, end_l0_k_sub, dur_k_sub_l0, l0_name_k, q_idx, k_idx
                 ))
                 resource_free_time["MTE1"] = end_l0_k_sub
-                l1_slots_k[slot_l1_k] = end_l0_k_sub
-                end_l0_k = end_l0_k_sub
 
                 dur_mac_sub = self._calc_mac_cycles_c1(self.s1_base, actual_n, self.d_base)
                 if i == 0:
@@ -820,7 +818,9 @@ class C1Modeler:
                 ))
                 resource_free_time["MAC"] = end_mac_sub
                 last_mac_end_c1 = end_mac_sub
+                l0_slots_k[sub_slot] = end_mac_sub
 
+            l1_slots_k[slot_l1_k] = resource_free_time["MTE1"]
             size_p_fix = self._calc_fixpipe_p_size()
             dur_fix_p = self._calc_fixpipe_cycles(size_p_fix)
             start_fix_p = max(resource_free_time["FIXPIPE"], last_mac_end_c1)
@@ -996,43 +996,38 @@ class C1Modeler:
         slot_l0_v = k_idx % len(l0_slots_v)
 
         if split_type_c2 == 'N':
-            # matmulN for C2: per-sub-tile V load (MTE2 V_sub + MTE1 V_sub) inside loop
             sub_n = self.baseN_C2
             last_mac_end_c2 = 0.0
-            end_l0_v = 0.0
-            end_fix_o = 0.0
+            # ONE MTE2 for full V block
+            size_v_full = self._calc_v_size()
+            block_id_v = f"V{k_idx}"
+            cached_v = l1_cache.check_v(block_id_v)
+            if cached_v is not None:
+                end_l1_v = cached_v
+            else:
+                dur_v_l1 = self._calc_mte2_cycles(size_v_full, use_l2=use_l2_for_v)
+                start_l1_v = max(resource_free_time["MTE2"], l1_slots_v[slot_l1_v], p_ready_time)
+                end_l1_v = start_l1_v + dur_v_l1
+                self.timeline.append(TimelineEvent(
+                    "MTE2", f"Load {l1_name_v} (V{k_idx+1})",
+                    start_l1_v, end_l1_v, dur_v_l1, l1_name_v,
+                    q_idx, k_idx, is_l2_hit=use_l2_for_v
+                ))
+                resource_free_time["MTE2"] = end_l1_v
+                l1_cache.store_v(block_id_v, size_v_full, end_l1_v)
             for i in range(sub_count_c2):
                 actual_n = min(sub_n, self.d_base - i * sub_n)
                 size_v_sub = self.s2_base * actual_n * self._get_kv_element_size()
+                sub_slot = i % len(l0_slots_v)
 
-                # MTE2 V_sub[i]: load sub-tile to L1 (with L1 cache check)
-                block_id_v_sub = f"V{k_idx}_sub{i}"
-                cached_v_sub = l1_cache.check_v(block_id_v_sub)
-                if cached_v_sub is not None:
-                    end_l1_v_sub = cached_v_sub
-                else:
-                    dur_v_sub_l1 = self._calc_mte2_cycles(size_v_sub, use_l2=use_l2_for_v)
-                    start_l1_v_sub = max(resource_free_time["MTE2"], l1_slots_v[slot_l1_v], p_ready_time)
-                    end_l1_v_sub = start_l1_v_sub + dur_v_sub_l1
-                    self.timeline.append(TimelineEvent(
-                        "MTE2", f"Load {l1_name_v} (V{k_idx+1}_sub{i})",
-                        start_l1_v_sub, end_l1_v_sub, dur_v_sub_l1, l1_name_v,
-                        q_idx, k_idx, is_l2_hit=use_l2_for_v
-                    ))
-                    resource_free_time["MTE2"] = end_l1_v_sub
-                    l1_cache.store_v(block_id_v_sub, size_v_sub, end_l1_v_sub)
-
-                # MTE1 V_sub[i]: move sub-tile from L1 to L0
                 dur_v_sub_l0 = self._calc_mte1_cycles(size_v_sub)
-                start_l0_v_sub = max(resource_free_time["MTE1"], end_l1_v_sub, l0_slots_v[slot_l0_v])
+                start_l0_v_sub = max(resource_free_time["MTE1"], end_l1_v, l0_slots_v[sub_slot])
                 end_l0_v_sub = start_l0_v_sub + dur_v_sub_l0
                 self.timeline.append(TimelineEvent(
                     "MTE1", f"Load {l0_name_v} (V{k_idx+1}_sub{i})",
                     start_l0_v_sub, end_l0_v_sub, dur_v_sub_l0, l0_name_v, q_idx, k_idx
                 ))
                 resource_free_time["MTE1"] = end_l0_v_sub
-                l1_slots_v[slot_l1_v] = end_l0_v_sub
-                end_l0_v = end_l0_v_sub
 
                 dur_mac_sub = self._calc_mac_cycles_c2(self.s1_base, actual_n, self.s2_base)
                 if i == 0:
@@ -1046,7 +1041,9 @@ class C1Modeler:
                 ))
                 resource_free_time["MAC"] = end_mac_sub
                 last_mac_end_c2 = end_mac_sub
+                l0_slots_v[sub_slot] = end_mac_sub
 
+            l1_slots_v[slot_l1_v] = resource_free_time["MTE1"]
             size_fo = self._calc_fixpipe_o_size()
             dur_fix_o = self._calc_fixpipe_cycles(size_fo)
             start_fix_o = max(resource_free_time["FIXPIPE"], last_mac_end_c2)
@@ -1196,25 +1193,23 @@ class C1Modeler:
                 # matmulN: per-sub-tile K load (MTE2 K_sub + MTE1 K_sub) inside loop
                 sub_n = self.baseN_C1
                 last_mac_end_c1 = 0.0
-                end_l0_k = 0.0
-                end_fix_p = 0.0
+                # ONE MTE2 for full K block
+                size_k_full = self._calc_k_size()
+                end_l1_k = self._mte2_to_l1(
+                    f"K{k_idx}", size_k_full, use_l2_for_k,
+                    l1_name_k, l1_slots_k, slot_l1_k, resource_free_time, q_idx, k_idx,
+                    f"Load {l1_name_k} (K{k_idx+1})", l1_cache, 'k'
+                )
                 for i in range(sub_count):
                     actual_n = min(sub_n, self.s2_base - i * sub_n)
                     size_k_sub = actual_n * self.d_base * self._get_kv_element_size()
+                    sub_slot = i % len(l0_slots_k)
 
-                    # MTE2 K_sub[i]: load sub-tile to L1 (with L1 cache check)
-                    end_l1_k_sub = self._mte2_to_l1(
-                        f"K{k_idx}_sub{i}", size_k_sub, use_l2_for_k,
-                        l1_name_k, l1_slots_k, slot_l1_k, resource_free_time, q_idx, k_idx,
-                        f"Load {l1_name_k} (K{k_idx+1}_sub{i})", l1_cache, 'k'
-                    )
-
-                    # MTE1 K_sub[i]: move sub-tile from L1 to L0B
                     dur_k_sub_l0 = self._calc_mte1_cycles(size_k_sub)
                     start_l0_k_sub = max(
                         resource_free_time["MTE1"],
-                        end_l1_k_sub,
-                        l0_slots_k[slot_l0_k]
+                        end_l1_k,
+                        l0_slots_k[sub_slot]
                     )
                     end_l0_k_sub = start_l0_k_sub + dur_k_sub_l0
                     self.timeline.append(TimelineEvent(
@@ -1222,8 +1217,6 @@ class C1Modeler:
                         start_l0_k_sub, end_l0_k_sub, dur_k_sub_l0, l0_name_k, q_idx, k_idx
                     ))
                     resource_free_time["MTE1"] = end_l0_k_sub
-                    l1_slots_k[slot_l1_k] = end_l0_k_sub
-                    end_l0_k = end_l0_k_sub
 
                     dur_mac_sub = self._calc_mac_cycles_c1(self.s1_base, actual_n, self.d_base)
                     if i == 0:
@@ -1238,7 +1231,9 @@ class C1Modeler:
                     ))
                     resource_free_time["MAC"] = end_mac_sub
                     last_mac_end_c1 = end_mac_sub
+                    l0_slots_k[sub_slot] = end_mac_sub
 
+                l1_slots_k[slot_l1_k] = resource_free_time["MTE1"]
                 size_p_fix = self._calc_fixpipe_p_size()
                 dur_fix_p = self._calc_fixpipe_cycles(size_p_fix)
                 start_fix_p = max(resource_free_time["FIXPIPE"], last_mac_end_c1)
@@ -1417,40 +1412,36 @@ class C1Modeler:
                 # matmulN for C2: per-sub-tile V load (MTE2 V_sub + MTE1 V_sub) inside loop
                 sub_n_c2 = self.baseN_C2
                 last_mac_end_c2 = 0.0
-                end_l0_v = 0.0
-                end_fix_o = 0.0
+                # ONE MTE2 for full V block
+                size_v_full = self._calc_v_size()
+                block_id_v = f"V{k_idx}"
+                cached_v = l1_cache.check_v(block_id_v)
+                if cached_v is not None:
+                    end_l1_v = cached_v
+                else:
+                    dur_v_l1 = self._calc_mte2_cycles(size_v_full, use_l2=use_l2_for_v)
+                    start_l1_v = max(resource_free_time["MTE2"], l1_slots_v[slot_l1_v], end_vector_v1)
+                    end_l1_v = start_l1_v + dur_v_l1
+                    self.timeline.append(TimelineEvent(
+                        "MTE2", f"Load {l1_name_v} (V{k_idx+1})",
+                        start_l1_v, end_l1_v, dur_v_l1, l1_name_v,
+                        q_idx, k_idx, is_l2_hit=use_l2_for_v
+                    ))
+                    resource_free_time["MTE2"] = end_l1_v
+                    l1_cache.store_v(block_id_v, size_v_full, end_l1_v)
                 for i in range(sub_count_c2):
                     actual_n = min(sub_n_c2, self.d_base - i * sub_n_c2)
                     size_v_sub = self.s2_base * actual_n * self._get_kv_element_size()
+                    sub_slot = i % len(l0_slots_v)
 
-                    # MTE2 V_sub[i]: load sub-tile to L1 (with L1 cache check)
-                    block_id_v_sub = f"V{k_idx}_sub{i}"
-                    cached_v_sub = l1_cache.check_v(block_id_v_sub)
-                    if cached_v_sub is not None:
-                        end_l1_v_sub = cached_v_sub
-                    else:
-                        dur_v_sub_l1 = self._calc_mte2_cycles(size_v_sub, use_l2=use_l2_for_v)
-                        start_l1_v_sub = max(resource_free_time["MTE2"], l1_slots_v[slot_l1_v], end_vector_v1)
-                        end_l1_v_sub = start_l1_v_sub + dur_v_sub_l1
-                        self.timeline.append(TimelineEvent(
-                            "MTE2", f"Load {l1_name_v} (V{k_idx+1}_sub{i})",
-                            start_l1_v_sub, end_l1_v_sub, dur_v_sub_l1, l1_name_v,
-                            q_idx, k_idx, is_l2_hit=use_l2_for_v
-                        ))
-                        resource_free_time["MTE2"] = end_l1_v_sub
-                        l1_cache.store_v(block_id_v_sub, size_v_sub, end_l1_v_sub)
-
-                    # MTE1 V_sub[i]: move sub-tile from L1 to L0
                     dur_v_sub_l0 = self._calc_mte1_cycles(size_v_sub)
-                    start_l0_v_sub = max(resource_free_time["MTE1"], end_l1_v_sub, l0_slots_v[slot_l0_v])
+                    start_l0_v_sub = max(resource_free_time["MTE1"], end_l1_v, l0_slots_v[sub_slot])
                     end_l0_v_sub = start_l0_v_sub + dur_v_sub_l0
                     self.timeline.append(TimelineEvent(
                         "MTE1", f"Load {l0_name_v} (V{k_idx+1}_sub{i})",
                         start_l0_v_sub, end_l0_v_sub, dur_v_sub_l0, l0_name_v, q_idx, k_idx
                     ))
                     resource_free_time["MTE1"] = end_l0_v_sub
-                    l1_slots_v[slot_l1_v] = end_l0_v_sub
-                    end_l0_v = end_l0_v_sub
 
                     dur_mac_sub = self._calc_mac_cycles_c2(self.s1_base, actual_n, self.s2_base)
                     if i == 0:
@@ -1464,7 +1455,9 @@ class C1Modeler:
                     ))
                     resource_free_time["MAC"] = end_mac_sub
                     last_mac_end_c2 = end_mac_sub
+                    l0_slots_v[sub_slot] = end_mac_sub
 
+                l1_slots_v[slot_l1_v] = resource_free_time["MTE1"]
                 size_fo = self._calc_fixpipe_o_size()
                 dur_fix_o = self._calc_fixpipe_cycles(size_fo)
                 start_fix_o = max(resource_free_time["FIXPIPE"], last_mac_end_c2)
@@ -1625,24 +1618,23 @@ class C1Modeler:
                 # matmulN: per-sub-tile K load (MTE2 K_sub + MTE1 K_sub) inside loop
                 sub_n = self.baseN_C1
                 last_mac_end_c1 = 0.0
-                end_l0_k = 0.0
+                # ONE MTE2 for full K block (moved before loop)
+                size_k_full = self._calc_k_size()
+                end_l1_k = self._mte2_to_l1(
+                    f"K{k_idx}", size_k_full, use_l2_for_k,
+                    l1_name_k, l1_slots_k, slot_l1_k, resource_free_time, q_idx, k_idx,
+                    f"Load {l1_name_k} (K{k_idx+1})", l1_cache, 'k'
+                )
                 for i in range(sub_count_nb):
                     actual_n = min(sub_n, self.s2_base - i * sub_n)
                     size_k_sub = actual_n * self.d_base * self._get_kv_element_size()
+                    sub_slot = i % len(l0_slots_k)
 
-                    # MTE2 K_sub[i]: load sub-tile to L1 (with L1 cache check)
-                    end_l1_k_sub = self._mte2_to_l1(
-                        f"K{k_idx}_sub{i}", size_k_sub, use_l2_for_k,
-                        l1_name_k, l1_slots_k, slot_l1_k, resource_free_time, q_idx, k_idx,
-                        f"Load {l1_name_k} (K{k_idx+1}_sub{i})", l1_cache, 'k'
-                    )
-
-                    # MTE1 K_sub[i]: move sub-tile from L1 to L0B
                     dur_k_sub_l0 = self._calc_mte1_cycles(size_k_sub)
                     start_l0_k_sub = max(
                         resource_free_time["MTE1"],
-                        end_l1_k_sub,
-                        l0_slots_k[slot_l0_k]
+                        end_l1_k,
+                        l0_slots_k[sub_slot]
                     )
                     end_l0_k_sub = start_l0_k_sub + dur_k_sub_l0
                     self.timeline.append(TimelineEvent(
@@ -1650,8 +1642,6 @@ class C1Modeler:
                         start_l0_k_sub, end_l0_k_sub, dur_k_sub_l0, l0_name_k, q_idx, k_idx
                     ))
                     resource_free_time["MTE1"] = end_l0_k_sub
-                    l1_slots_k[slot_l1_k] = end_l0_k_sub
-                    end_l0_k = end_l0_k_sub
 
                     dur_mac_sub = self._calc_mac_cycles_c1(self.s1_base, actual_n, self.d_base)
                     if i == 0:
@@ -1666,7 +1656,9 @@ class C1Modeler:
                     ))
                     resource_free_time["MAC"] = end_mac_sub
                     last_mac_end_c1 = end_mac_sub
+                    l0_slots_k[sub_slot] = end_mac_sub
 
+                l1_slots_k[slot_l1_k] = resource_free_time["MTE1"]
                 size_p_fix = self._calc_fixpipe_p_size()
                 dur_fix_p = self._calc_fixpipe_cycles(size_p_fix)
                 start_fix_p = max(resource_free_time["FIXPIPE"], last_mac_end_c1)
@@ -1815,40 +1807,36 @@ class C1Modeler:
                 # matmulN for C2: per-sub-tile V load (MTE2 V_sub + MTE1 V_sub) inside loop
                 sub_n_c2 = self.baseN_C2
                 last_mac_end_c2 = 0.0
-                end_l0_v = 0.0
-                end_fix_o = 0.0
+                # ONE MTE2 for full V block
+                size_v_full = self._calc_v_size()
+                block_id_v = f"V{k_idx}"
+                cached_v = l1_cache.check_v(block_id_v)
+                if cached_v is not None:
+                    end_l1_v = cached_v
+                else:
+                    dur_v_l1 = self._calc_mte2_cycles(size_v_full, use_l2=use_l2_for_v)
+                    start_l1_v = max(resource_free_time["MTE2"], l1_slots_v[slot_l1_v], p_ready)
+                    end_l1_v = start_l1_v + dur_v_l1
+                    self.timeline.append(TimelineEvent(
+                        "MTE2", f"Load {l1_name_v} (V{k_idx+1})",
+                        start_l1_v, end_l1_v, dur_v_l1, l1_name_v,
+                        q_idx, k_idx, is_l2_hit=use_l2_for_v
+                    ))
+                    resource_free_time["MTE2"] = end_l1_v
+                    l1_cache.store_v(block_id_v, size_v_full, end_l1_v)
                 for i in range(sub_count_nb_c2):
                     actual_n = min(sub_n_c2, self.d_base - i * sub_n_c2)
                     size_v_sub = self.s2_base * actual_n * self._get_kv_element_size()
+                    sub_slot = i % len(l0_slots_v)
 
-                    # MTE2 V_sub[i]: load sub-tile to L1 (with L1 cache check)
-                    block_id_v_sub = f"V{k_idx}_sub{i}"
-                    cached_v_sub = l1_cache.check_v(block_id_v_sub)
-                    if cached_v_sub is not None:
-                        end_l1_v_sub = cached_v_sub
-                    else:
-                        dur_v_sub_l1 = self._calc_mte2_cycles(size_v_sub, use_l2=use_l2_for_v)
-                        start_l1_v_sub = max(resource_free_time["MTE2"], l1_slots_v[slot_l1_v], p_ready)
-                        end_l1_v_sub = start_l1_v_sub + dur_v_sub_l1
-                        self.timeline.append(TimelineEvent(
-                            "MTE2", f"Load {l1_name_v} (V{k_idx+1}_sub{i})",
-                            start_l1_v_sub, end_l1_v_sub, dur_v_sub_l1, l1_name_v,
-                            q_idx, k_idx, is_l2_hit=use_l2_for_v
-                        ))
-                        resource_free_time["MTE2"] = end_l1_v_sub
-                        l1_cache.store_v(block_id_v_sub, size_v_sub, end_l1_v_sub)
-
-                    # MTE1 V_sub[i]: move sub-tile from L1 to L0
                     dur_v_sub_l0 = self._calc_mte1_cycles(size_v_sub)
-                    start_l0_v_sub = max(resource_free_time["MTE1"], end_l1_v_sub, l0_slots_v[slot_l0_v])
+                    start_l0_v_sub = max(resource_free_time["MTE1"], end_l1_v, l0_slots_v[sub_slot])
                     end_l0_v_sub = start_l0_v_sub + dur_v_sub_l0
                     self.timeline.append(TimelineEvent(
                         "MTE1", f"Load {l0_name_v} (V{k_idx+1}_sub{i})",
                         start_l0_v_sub, end_l0_v_sub, dur_v_sub_l0, l0_name_v, q_idx, k_idx
                     ))
                     resource_free_time["MTE1"] = end_l0_v_sub
-                    l1_slots_v[slot_l1_v] = end_l0_v_sub
-                    end_l0_v = end_l0_v_sub
 
                     dur_mac_sub = self._calc_mac_cycles_c2(self.s1_base, actual_n, self.s2_base)
                     if i == 0:
@@ -1862,7 +1850,9 @@ class C1Modeler:
                     ))
                     resource_free_time["MAC"] = end_mac_sub
                     last_mac_end_c2 = end_mac_sub
+                    l0_slots_v[sub_slot] = end_mac_sub
 
+                l1_slots_v[slot_l1_v] = resource_free_time["MTE1"]
                 size_fo = self._calc_fixpipe_o_size()
                 dur_fix_o = self._calc_fixpipe_cycles(size_fo)
                 start_fix_o = max(resource_free_time["FIXPIPE"], last_mac_end_c2)

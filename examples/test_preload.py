@@ -16,10 +16,10 @@ print("=" * 80)
 
 modeler = C1Modeler(
     s1_total=256,
-    s2_total=1024,
+    s2_total=512,
     d_total=128,
     s1_base_size=128,
-    s2_base_size=256,
+    s2_base_size=128,
     d_base_size=128,
     q_data_type=DataType.FP16,
     kv_data_type=DataType.FP16,
@@ -63,10 +63,10 @@ print("=" * 80)
 
 modeler2 = C1Modeler(
     s1_total=256,
-    s2_total=1024,
+    s2_total=512,
     d_total=128,
     s1_base_size=128,
-    s2_base_size=256,
+    s2_base_size=128,
     d_base_size=128,
     q_data_type=DataType.FP16,
     kv_data_type=DataType.FP16,

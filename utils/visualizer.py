@@ -35,7 +35,7 @@ class TimelineVisualizer:
         "MTE2A": 3.4
     }
 
-    Y_LABELS = ["VECTOR_V2", "VECTOR_V1", "MTE3", "FIXPIPE", "MAC", "MTE1B", "MTE1A", "MTE2B", "MTE2A"]
+    Y_LABELS = ["VECTOR_V2", "VECTOR_V1", "MTE3", "FIXPIPE", "MAC", "MTE1\n(L0B)", "MTE1\n(L0A)", "MTE2", "MTE2"]
 
     @staticmethod
     def plot_timeline(
@@ -82,25 +82,17 @@ class TimelineVisualizer:
                     label = f"Q{event.q_block_idx+1}"
                 elif "K" in event.operation:
                     label = f"K{event.k_block_idx+1}"
-                elif "V" in event.operation and event.unit == "MTE2":
-                    # V矩阵加载
+                elif "V" in event.operation:
                     label = f"V{event.k_block_idx+1}"
-                elif "V" in event.operation and event.unit == "MTE1":
-                    # V矩阵加载
-                    label = f"V{event.k_block_idx+1}"
-                elif event.operation == "P":
-                    # P矩阵，显示为P11格式
+                elif "P" in event.operation:
                     label = f"P{event.q_block_idx+1}{event.k_block_idx+1}"
-                elif event.operation == "O":
-                    # O矩阵，显示为O11格式
+                elif "O" in event.operation:
                     label = f"O{event.q_block_idx+1}{event.k_block_idx+1}"
-                else:
-                    label = f"Q{event.q_block_idx+1}K{event.k_block_idx+1}"
 
                 if event.is_l2_hit:
                     label += "(L2)"
 
-                if event.duration > total_cycles * 0.015:
+                if event.duration > total_cycles * 0.003:
                     ax.text(event.start_time + event.duration/2, y - 0.2, label,
                            ha='center', va='top', fontsize=8, color='black')
 
