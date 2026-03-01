@@ -204,19 +204,76 @@ N=2
 - 超出容量时按LRU策略替换对应槽中的最旧块。
 
 ### 4.4 矩阵乘切分
-加上两组输入参数baseM_C1，baseN_C1,baseK_C1,这是c1进行矩阵乘的基本块的最大单位，参数baseM_C2，baseN_C2,baseK_C2,这是c2进行矩阵乘的基本块的最大单位。
 
-比如baseM_C1=128，baseN_C1=128，baseK_C1=128，如果[s1_base_size,d_base_size]=[128,128]，那么单个C1就会L0A搬运一次只计算一次，如果[s1_base_size,d_base_size]=[128,256]，此时256/128=2，那么这个基本块单个C1内会被切成2个[128,128]进行计算。fixpip会等这两次算完进行累加才进行搬运，因为这是一个C1的全流程。C2同理。
+**输入参数**：baseM_C1/baseN_C1/baseK_C1 是 C1 MAC 的最大子块尺寸；baseM_C2/baseN_C2/baseK_C2 是 C2 MAC 的最大子块尺寸。
 
-只会有以下三种情况：
-1. matmulN
-矩阵乘切N，即右矩阵的列
+**切分判定优先级**（先判 N，再判 K，否则 Full）：
+```
+C1: s2_base > baseN_C1 → matmulN (sub_count = ceil(s2_base / baseN_C1))
+    d_base  > baseK_C1 → matmulK (sub_count = ceil(d_base  / baseK_C1))
+    否则               → matmulFull
 
-2. matmulK
-矩阵乘切K，即左矩阵的列，右矩阵的行
+C2: d_base  > baseN_C2 → matmulN (sub_count = ceil(d_base  / baseN_C2))
+    s2_base > baseK_C2 → matmulK (sub_count = ceil(s2_base / baseK_C2))
+    否则               → matmulFull
+```
 
-3. matmulFull
-不切分直接计算
+**通用规则**：不论哪种切分，MTE2 始终对完整基本块做一次整体加载（DRAM/L2 → L1），L0 分块由 MTE1 按子块搬运。
+
+---
+
+#### 1. matmulN（切 N 维，即右矩阵的列）
+
+```
+C1: 右矩阵 K 形状 [s2_base, d_base]，切 s2_base → 子块 [actual_n, d_base]
+C2: 右矩阵 V 形状 [s2_base, d_base]，切 d_base  → 子块 [s2_base, actual_n]
+```
+
+每个子块独立，序列为（N 维不累加 L0C，每子块有独立 FIXPIPE）：
+```
+MTE2 (完整块, 1次)
+└─ for i in range(sub_count):
+       MTE1_i  (子块 L1 → L0)
+       MAC_i   (i=0: 等 MTE1_i + 左矩阵就绪;  i>0: 等 MTE1_i + 上一 FIXPIPE 结束)
+       FIXPIPE_i
+```
+
+L0 槽位：所有子块共用同一个 `slot_l0`，MTE1 必须等当前槽位被 MAC 释放后才能写入下一子块。L0_db 在 matmulN 内不产生流水收益（槽位不轮换）。
+
+---
+
+#### 2. matmulK（切 K 维，即左矩阵的列 / 右矩阵的行）
+
+```
+C1: 右矩阵 K 形状 [s2_base, d_base]，切 d_base  → 子块 [s2_base, actual_k]
+C2: 右矩阵 V 形状 [s2_base, d_base]，切 s2_base → 子块 [actual_k, d_base]
+```
+
+K 维累加到 L0C，全部子块 MAC 完成后发出一次 FIXPIPE：
+```
+MTE2 (完整块, 1次)
+└─ for i in range(sub_count):
+       sub_slot = i % len(l0_slots)        # 轮换 L0 槽位
+       MTE1_i  (子块 L1 → L0[sub_slot])
+       MAC_i   (i=0: 等 MTE1_i + 左矩阵就绪;  i>0: 等 MTE1_i)   ← L0C 累加
+       l0_slots[sub_slot] = MAC_i 结束时间
+l1_slots = MTE1 全部完成后释放
+FIXPIPE (1次, 等所有 MAC 完成)
+```
+
+**L0_db 对 matmulK 的影响**：
+- `L0_db=False`（1 槽）：sub_slot 恒为 0，MTE1_i+1 必须等 MAC_i 释放槽位，MTE1 与 MAC **串行**。
+- `L0_db=True` （2 槽）：sub_slot 在 0/1 间轮换，MTE1_i+1 可在 MAC_i 运行时写入另一槽，MTE1 与 MAC **可流水**。
+
+---
+
+#### 3. matmulFull（不切分）
+
+```
+MTE2 (完整块, 1次) → MTE1 (完整块, 1次) → MAC (1次) → FIXPIPE (1次)
+```
+
+L0 槽位：使用固定的 `slot_l0`，MTE1 等槽位空闲后搬入，MAC 完成时释放。
 
 ## 5. 特殊逻辑:
 1. full_load=True: Q 矩阵在模拟开始前全部加载到 L1，后续不再触发 Q 的 MTE2。
@@ -226,7 +283,7 @@ N=2
 5. is_l2cache=True：相同基本块第一次加载使用DRAM带宽，下次加载使用L2带宽。不使能时每次均为DRAM带宽。
    - K 块：第二个及以上 q_idx 复用时使用L2带宽（`use_l2 = is_l2cache and q_idx > 0`）
    - V 块：同K块，第二个及以上 q_idx 使用L2带宽（`use_l2 = is_l2cache and q_idx > 0`）
-6. matmulK切分：K维度切分时L0C内累加，所有子块MAC完成后才发出一次FIXPIPE。
+6. matmulK切分：K维度切分时L0C内累加，所有子块MAC完成后才发出一次FIXPIPE（详见4.4节）。
 
 ## 6. 可视化增强
 
