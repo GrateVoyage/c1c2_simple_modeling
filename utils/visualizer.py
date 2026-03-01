@@ -22,20 +22,20 @@ class TimelineVisualizer:
         "VECTOR_V2": "#E59866"
     }
 
-    # Y轴映射 (从下到上: VECTOR_V2, VECTOR_V1, MTE3, FIXPIPE, MAC, L0B, L0A, L1B, L1A)
+    # Y轴映射 (从下到上: VECTOR_V2, VECTOR_V1, MTE3, FIXPIPE, MAC, MTE1B, MTE1A, MTE2B, MTE2A)
     Y_MAP = {
         "VECTOR_V2": 0,
         "VECTOR_V1": 0.3,
         "MTE3": 0.8,
         "FIXPIPE": 1.3,
         "MAC": 1.8,
-        "L0B": 2.3,
-        "L0A": 2.6,
-        "L1B": 3.1,
-        "L1A": 3.4
+        "MTE1B": 2.3,
+        "MTE1A": 2.6,
+        "MTE2B": 3.1,
+        "MTE2A": 3.4
     }
 
-    Y_LABELS = ["VECTOR_V2", "VECTOR_V1", "MTE3", "FIXPIPE", "MAC", "L0B", "L0A", "L1B", "L1A"]
+    Y_LABELS = ["VECTOR_V2", "VECTOR_V1", "MTE3", "FIXPIPE", "MAC", "MTE1B", "MTE1A", "MTE2B", "MTE2A"]
 
     @staticmethod
     def plot_timeline(
@@ -116,7 +116,7 @@ class TimelineVisualizer:
                 mpatches.Patch(color=TimelineVisualizer.COLORS["MTE2"], label='MTE2 (DRAM)'),
                 mpatches.Patch(color=TimelineVisualizer.COLORS["MTE2_L2"], label='MTE2 (L2 Cache)'),
                 mpatches.Patch(color=TimelineVisualizer.COLORS["MTE1"], label='MTE1'),
-                mpatches.Patch(color=TimelineVisualizer.COLORS["MTE3"], label='MTE3 (UB->CUBE)'),
+                mpatches.Patch(color=TimelineVisualizer.COLORS["MTE3"], label='MTE3 (UB->L1)'),
                 mpatches.Patch(color=TimelineVisualizer.COLORS["MAC"], label='MAC'),
                 mpatches.Patch(color=TimelineVisualizer.COLORS["FIXPIPE"], label='FIXPIPE'),
                 mpatches.Patch(color=TimelineVisualizer.COLORS["VECTOR_V1"], label='VECTOR V1'),

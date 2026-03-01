@@ -842,31 +842,30 @@ class C1Modeler:
                 f"Load {l1_name_k} (K{k_idx+1})", l1_cache, 'k'
             )
 
-            dur_k_l0 = self._calc_mte1_cycles(size_k)
-            start_l0_k = max(
-                resource_free_time["MTE1"],
-                end_l1_k,
-                l0_slots_k[slot_l0_k]
-            )
-            end_l0_k = start_l0_k + dur_k_l0
-            self.timeline.append(TimelineEvent(
-                "MTE1", f"Load {l0_name_k} (K{k_idx+1})",
-                start_l0_k, end_l0_k, dur_k_l0, l0_name_k, q_idx, k_idx
-            ))
-            resource_free_time["MTE1"] = end_l0_k
-            l1_slots_k[slot_l1_k] = end_l0_k
-
             if split_type == 'K':
+                # matmulK: ONE MTE2 for full K, per-sub-tile MTE1→MAC, ONE FIXPIPE
                 sub_k = math.ceil(self.d_base / sub_count)
-                last_mac_end_c1 = end_l0_k
+                last_mac_end_c1 = 0.0
                 for i in range(sub_count):
                     actual_k = min(sub_k, self.d_base - i * sub_k)
+                    size_k_sub = self.s2_base * actual_k * self._get_kv_element_size()
+                    sub_slot = i % len(l0_slots_k)
+
+                    dur_k_sub_l0 = self._calc_mte1_cycles(size_k_sub)
+                    start_l0_k_sub = max(resource_free_time["MTE1"], end_l1_k, l0_slots_k[sub_slot])
+                    end_l0_k_sub = start_l0_k_sub + dur_k_sub_l0
+                    self.timeline.append(TimelineEvent(
+                        "MTE1", f"Load {l0_name_k} (K{k_idx+1}_sub{i})",
+                        start_l0_k_sub, end_l0_k_sub, dur_k_sub_l0, l0_name_k, q_idx, k_idx
+                    ))
+                    resource_free_time["MTE1"] = end_l0_k_sub
+
                     dur_mac_sub = self._calc_mac_cycles_c1(self.s1_base, self.s2_base, actual_k)
                     if i == 0:
                         start_mac_sub = max(resource_free_time["MAC"],
-                                            q_l0_ready_times[q_idx], end_l0_k)
+                                            q_l0_ready_times[q_idx], end_l0_k_sub)
                     else:
-                        start_mac_sub = resource_free_time["MAC"]
+                        start_mac_sub = max(resource_free_time["MAC"], end_l0_k_sub)
                     end_mac_sub = start_mac_sub + dur_mac_sub
                     self.timeline.append(TimelineEvent(
                         "MAC", "P", start_mac_sub, end_mac_sub, dur_mac_sub,
@@ -874,6 +873,9 @@ class C1Modeler:
                     ))
                     resource_free_time["MAC"] = end_mac_sub
                     last_mac_end_c1 = end_mac_sub
+                    l0_slots_k[sub_slot] = end_mac_sub
+
+                l1_slots_k[slot_l1_k] = resource_free_time["MTE1"]
 
                 size_p = self._calc_fixpipe_p_size()
                 dur_fix_p = self._calc_fixpipe_cycles(size_p)
@@ -884,9 +886,22 @@ class C1Modeler:
                     "UB", q_idx, k_idx
                 ))
                 resource_free_time["FIXPIPE"] = end_fix_p
-                l0_slots_k[slot_l0_k] = last_mac_end_c1
 
             else:
+                dur_k_l0 = self._calc_mte1_cycles(size_k)
+                start_l0_k = max(
+                    resource_free_time["MTE1"],
+                    end_l1_k,
+                    l0_slots_k[slot_l0_k]
+                )
+                end_l0_k = start_l0_k + dur_k_l0
+                self.timeline.append(TimelineEvent(
+                    "MTE1", f"Load {l0_name_k} (K{k_idx+1})",
+                    start_l0_k, end_l0_k, dur_k_l0, l0_name_k, q_idx, k_idx
+                ))
+                resource_free_time["MTE1"] = end_l0_k
+                l1_slots_k[slot_l1_k] = end_l0_k
+
                 dur_mac_c1 = self._calc_mac_cycles_c1(self.s1_base, self.s2_base, self.d_base)
                 start_mac_c1 = max(
                     resource_free_time["MAC"],
@@ -1228,7 +1243,7 @@ class C1Modeler:
                 l0_slots_k[slot_l0_k] = last_mac_end_c1
 
             else:
-                # For 'K' and 'full': monolithic K load before MAC
+                # For 'K' and 'full': monolithic K load (MTE2) before MAC
                 size_k = self._calc_k_size()
 
                 # A. L1加载 (MTE2, with L1 cache check)
@@ -1238,33 +1253,32 @@ class C1Modeler:
                     f"Load {l1_name_k} (K{k_idx+1})", l1_cache, 'k'
                 )
 
-                # B. L0搬运 (MTE1)
-                dur_k_l0 = self._calc_mte1_cycles(size_k)
-                start_l0_k = max(
-                    resource_free_time["MTE1"],
-                    end_l1_k,
-                    l0_slots_k[slot_l0_k]
-                )
-                end_l0_k = start_l0_k + dur_k_l0
-                self.timeline.append(TimelineEvent(
-                    "MTE1", f"Load {l0_name_k} (K{k_idx+1})",
-                    start_l0_k, end_l0_k, dur_k_l0, l0_name_k, q_idx, k_idx
-                ))
-                resource_free_time["MTE1"] = end_l0_k
-                l1_slots_k[slot_l1_k] = end_l0_k
-
                 if split_type == 'K':
-                    # matmulK: split K (d_base) dimension, L0C accumulates
+                    # matmulK: ONE MTE2 for full K, per-sub-tile MTE1→MAC, ONE FIXPIPE
                     sub_k = math.ceil(self.d_base / sub_count)
-                    last_mac_end_c1 = end_l0_k  # initial dependency
+                    last_mac_end_c1 = 0.0
                     for i in range(sub_count):
                         actual_k = min(sub_k, self.d_base - i * sub_k)
+                        size_k_sub = self.s2_base * actual_k * self._get_kv_element_size()
+                        sub_slot = i % len(l0_slots_k)
+
+                        # B. Per-sub-tile MTE1: L1 → L0B
+                        dur_k_sub_l0 = self._calc_mte1_cycles(size_k_sub)
+                        start_l0_k_sub = max(resource_free_time["MTE1"], end_l1_k, l0_slots_k[sub_slot])
+                        end_l0_k_sub = start_l0_k_sub + dur_k_sub_l0
+                        self.timeline.append(TimelineEvent(
+                            "MTE1", f"Load {l0_name_k} (K{k_idx+1}_sub{i})",
+                            start_l0_k_sub, end_l0_k_sub, dur_k_sub_l0, l0_name_k, q_idx, k_idx
+                        ))
+                        resource_free_time["MTE1"] = end_l0_k_sub
+
+                        # C. MAC for this sub-tile (accumulate in L0C)
                         dur_mac_sub = self._calc_mac_cycles_c1(self.s1_base, self.s2_base, actual_k)
                         if i == 0:
                             start_mac_sub = max(resource_free_time["MAC"],
-                                                q_l0_ready_times[q_idx], end_l0_k)
+                                                q_l0_ready_times[q_idx], end_l0_k_sub)
                         else:
-                            start_mac_sub = resource_free_time["MAC"]
+                            start_mac_sub = max(resource_free_time["MAC"], end_l0_k_sub)
                         end_mac_sub = start_mac_sub + dur_mac_sub
                         self.timeline.append(TimelineEvent(
                             "MAC", "P", start_mac_sub, end_mac_sub, dur_mac_sub,
@@ -1272,6 +1286,9 @@ class C1Modeler:
                         ))
                         resource_free_time["MAC"] = end_mac_sub
                         last_mac_end_c1 = end_mac_sub
+                        l0_slots_k[sub_slot] = end_mac_sub
+
+                    l1_slots_k[slot_l1_k] = resource_free_time["MTE1"]
 
                     # One FIXPIPE after all sub-MACs complete
                     size_p_fix = self._calc_fixpipe_p_size()
@@ -1283,10 +1300,23 @@ class C1Modeler:
                         "UB", q_idx, k_idx
                     ))
                     resource_free_time["FIXPIPE"] = end_fix_p
-                    l0_slots_k[slot_l0_k] = last_mac_end_c1  # release L0 slot after last MAC
 
                 else:
-                    # matmulFull
+                    # matmulFull: B. L0搬运 (MTE1) + MAC + FIXPIPE
+                    dur_k_l0 = self._calc_mte1_cycles(size_k)
+                    start_l0_k = max(
+                        resource_free_time["MTE1"],
+                        end_l1_k,
+                        l0_slots_k[slot_l0_k]
+                    )
+                    end_l0_k = start_l0_k + dur_k_l0
+                    self.timeline.append(TimelineEvent(
+                        "MTE1", f"Load {l0_name_k} (K{k_idx+1})",
+                        start_l0_k, end_l0_k, dur_k_l0, l0_name_k, q_idx, k_idx
+                    ))
+                    resource_free_time["MTE1"] = end_l0_k
+                    l1_slots_k[slot_l1_k] = end_l0_k
+
                     dur_mac_c1 = self._calc_mac_cycles_c1(self.s1_base, self.s2_base, self.d_base)
                     start_mac_c1 = max(
                         resource_free_time["MAC"],
@@ -1648,7 +1678,7 @@ class C1Modeler:
                 fixpipe_p_ready[k_idx] = end_fix_p
 
             else:
-                # For 'K' and 'full': monolithic K load before MAC
+                # For 'K' and 'full': monolithic K load (MTE2) before MAC
                 size_k = self._calc_k_size()
                 end_l1_k = self._mte2_to_l1(
                     f"K{k_idx}", size_k, use_l2_for_k,
@@ -1656,27 +1686,30 @@ class C1Modeler:
                     f"Load {l1_name_k} (K{k_idx+1})", l1_cache, 'k'
                 )
 
-                dur_k_l0 = self._calc_mte1_cycles(size_k)
-                start_l0_k = max(resource_free_time["MTE1"], end_l1_k, l0_slots_k[slot_l0_k])
-                end_l0_k = start_l0_k + dur_k_l0
-                self.timeline.append(TimelineEvent(
-                    "MTE1", f"Load {l0_name_k} (K{k_idx+1})",
-                    start_l0_k, end_l0_k, dur_k_l0, l0_name_k, q_idx, k_idx
-                ))
-                resource_free_time["MTE1"] = end_l0_k
-                l1_slots_k[slot_l1_k] = end_l0_k
-
                 if split_type_nb == 'K':
+                    # matmulK: ONE MTE2 for full K, per-sub-tile MTE1→MAC, ONE FIXPIPE
                     sub_k = math.ceil(self.d_base / sub_count_nb)
-                    last_mac_end_c1 = end_l0_k
+                    last_mac_end_c1 = 0.0
                     for i in range(sub_count_nb):
                         actual_k = min(sub_k, self.d_base - i * sub_k)
+                        size_k_sub = self.s2_base * actual_k * self._get_kv_element_size()
+                        sub_slot = i % len(l0_slots_k)
+
+                        dur_k_sub_l0 = self._calc_mte1_cycles(size_k_sub)
+                        start_l0_k_sub = max(resource_free_time["MTE1"], end_l1_k, l0_slots_k[sub_slot])
+                        end_l0_k_sub = start_l0_k_sub + dur_k_sub_l0
+                        self.timeline.append(TimelineEvent(
+                            "MTE1", f"Load {l0_name_k} (K{k_idx+1}_sub{i})",
+                            start_l0_k_sub, end_l0_k_sub, dur_k_sub_l0, l0_name_k, q_idx, k_idx
+                        ))
+                        resource_free_time["MTE1"] = end_l0_k_sub
+
                         dur_mac_sub = self._calc_mac_cycles_c1(self.s1_base, self.s2_base, actual_k)
                         if i == 0:
                             start_mac_sub = max(resource_free_time["MAC"],
-                                                q_l0_ready_times[q_idx], end_l0_k)
+                                                q_l0_ready_times[q_idx], end_l0_k_sub)
                         else:
-                            start_mac_sub = resource_free_time["MAC"]
+                            start_mac_sub = max(resource_free_time["MAC"], end_l0_k_sub)
                         end_mac_sub = start_mac_sub + dur_mac_sub
                         self.timeline.append(TimelineEvent(
                             "MAC", "P", start_mac_sub, end_mac_sub, dur_mac_sub,
@@ -1684,6 +1717,9 @@ class C1Modeler:
                         ))
                         resource_free_time["MAC"] = end_mac_sub
                         last_mac_end_c1 = end_mac_sub
+                        l0_slots_k[sub_slot] = end_mac_sub
+
+                    l1_slots_k[slot_l1_k] = resource_free_time["MTE1"]
 
                     size_fp = self._calc_fixpipe_p_size()
                     dur_fix_p = self._calc_fixpipe_cycles(size_fp)
@@ -1694,11 +1730,20 @@ class C1Modeler:
                         "UB", q_idx, k_idx
                     ))
                     resource_free_time["FIXPIPE"] = end_fix_p
-                    l0_slots_k[slot_l0_k] = last_mac_end_c1
                     fixpipe_p_ready[k_idx] = end_fix_p
 
                 else:
-                    # matmulFull
+                    # matmulFull: B. L0搬运 (MTE1) + MAC + FIXPIPE
+                    dur_k_l0 = self._calc_mte1_cycles(size_k)
+                    start_l0_k = max(resource_free_time["MTE1"], end_l1_k, l0_slots_k[slot_l0_k])
+                    end_l0_k = start_l0_k + dur_k_l0
+                    self.timeline.append(TimelineEvent(
+                        "MTE1", f"Load {l0_name_k} (K{k_idx+1})",
+                        start_l0_k, end_l0_k, dur_k_l0, l0_name_k, q_idx, k_idx
+                    ))
+                    resource_free_time["MTE1"] = end_l0_k
+                    l1_slots_k[slot_l1_k] = end_l0_k
+
                     dur_mac_c1 = self._calc_mac_cycles_c1(self.s1_base, self.s2_base, self.d_base)
                     start_mac_c1 = max(resource_free_time["MAC"], q_l0_ready_times[q_idx], end_l0_k)
                     end_mac_c1 = start_mac_c1 + dur_mac_c1
