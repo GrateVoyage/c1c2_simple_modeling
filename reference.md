@@ -143,17 +143,21 @@ STORE_UNITS = {
    - V2 的启动时间 = max(VECTOR 单元空闲时间, FIXPIPE-O 完成时间)。
 3. C2阶段P的完整路由：FIXPIPE(L0C→UB) → VECTOR_V1(UB处理) → MTE3(UB→L1) → MTE1(L1→L0A/B) → MAC-O。
    - MAC-O 同时依赖 MTE1-P（P已在L0）和 MTE1-V（V已在L0）两个条件。
-4. CUBE核内依赖关系如下，_表示后面组件等前面组件搬运或计算结束。
-- C1
-    - 消费者等生产者：
-    MTE2_MTE1、MAC_FIXPIPE、MTE1_MAC
-    - 生产者等消费者：
-    MTE1_MTE2、FIXPIPE_MAC、MAC_MTE1
-- C2
-    - 消费者等生产者：
-    MTE3_MTE1(P路由)、MTE2_MTE1(V加载)、MAC_FIXPIPE、MTE1_MAC
-    - 生产者等消费者：
-    MTE1_MTE3、MTE1_MTE2、FIXPIPE_MAC、MAC_MTE1
+4. **MTE2与MTE1并行执行**：后一个块的MTE2可以和前一个块的MTE1并行执行，只要L1有足够空间。
+   - MTE2开始时间 = max(MTE2资源空闲, 前一个MTE2完成时间)
+   - MTE1开始时间 = max(MTE1资源空闲, 前一个MTE1完成时间, L0槽位空闲)
+   - L1槽位追踪分离：分别记录mte2_free和mte1_free时间
+5. CUBE核内依赖关系如下，_表示后面组件等前面组件搬运或计算结束。
+ - C1
+     - 消费者等生产者：
+     MTE2_MTE1、MAC_FIXPIPE、MTE1_MAC
+     - 生产者等消费者：
+     MTE1_MTE2、FIXPIPE_MAC、MAC_MTE1
+ - C2
+     - 消费者等生产者：
+     MTE3_MTE1(P路由)、MTE2_MTE1(V加载)、MAC_FIXPIPE、MTE1_MAC
+     - 生产者等消费者：
+     MTE1_MTE3、MTE1_MTE2、FIXPIPE_MAC、MAC_MTE1
 
 5. CUBE和VECTOR核间，每个基本块的C1V1C2V2都是有依赖关系的，不同基本块之间的C1V1C2V2没有依赖关系。
 6. 所有组件之间如果没有依赖关系均可并行，以最早的时间执行。

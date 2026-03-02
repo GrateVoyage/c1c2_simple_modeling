@@ -51,3 +51,37 @@ C1Modeler(
 cd /mnt/g/WSL/chuqihang/model/c1c2_modeling && python -m pytest tests/ -q
 ```
 52 tests, ~0.7s.
+
+## 2026-03-02: MTE2与MTE1并行执行
+### 修改内容
+1. **L1槽位追踪分离**：从 `float` 改为 `{'mte2_free': float, 'mte1_free': float}`
+   - `mte2_free`: MTE2可以开始的时间（前一个MTE2完成）
+   - `mte1_free`: MTE1可以开始的时间（前一个MTE1完成）
+
+2. **MTE2并行调度**：只等前一个MTE2完成，不等MTE1
+   - 原代码：`start = max(resource_free_time["MTE2"], l1_slots[slot_idx])`
+   - 新代码：`start = max(resource_free_time["MTE2"], l1_slots[slot_idx]['mte2_free'])`
+
+3. **MTE1依赖调整**：等前一个MTE1完成
+   - 原代码：`start = max(resource_free_time["MTE1"], end_l1_k, l0_slots[slot])`
+   - 新代码：`start = max(resource_free_time["MTE1"], end_l1_k, l0_slots[slot], l1_slots[slot]['mte1_free'])`
+
+4. **VECTOR周期数调整**：V1=600, V2=100
+
+### 修改的函数
+- `_preload_q_blocks` - Q预加载循环
+- `_load_q_block` - Q加载逻辑
+- `_mte2_to_l1` - MTE2到L1搬运
+- `_process_c1_stage` - C1阶段处理
+- `_process_c1_only` - C1阶段处理（PRELOAD模式）
+- `_process_c2_stage` - C2阶段处理
+- `_process_k_blocks` - K块处理
+- `_process_n_buffer_group` - N_BUFFER模式处理
+
+### 性能效果
+- MTE2利用率从36.5%提升到49.1%
+- 总周期数从16571.4增加到46668.9（由于VECTOR周期数调整）
+
+### 提交信息
+- Commit: e92b879
+- 消息：实现MTE2与MTE1并行执行
