@@ -16,8 +16,8 @@ from core import DataType, InterCorePipeline, InnerCorePipeline, LoadOrder
 # ============================================================
 # 矩阵规模
 # ============================================================
-s1_total     = 256      # Q 的 sequence 长度（总行数），需被 s1_base_size 整除
-s2_total     = 256     # K/V 的 sequence 长度（总列数），需被 s2_base_size 整除
+s1_total     = 128      # Q 的 sequence 长度（总行数），需被 s1_base_size 整除
+s2_total     = 1024     # K/V 的 sequence 长度（总列数），需被 s2_base_size 整除
 d_total      = 128      # 特征维度，需被 d_base_size 整除
 
 # ============================================================
@@ -83,7 +83,7 @@ load_order = LoadOrder.LOAD_Q_FIRST     # LOAD_Q_FIRST: 先加载 Q 再加载 K
 #             （渐进启动：下一个 C1 在当前 MAC 完成后立即发射，不等 V2）
 #   N_BUFFER: C1C1 → V1V1 → C2C2 → V2V2（批量流水，N=2 组同时推进）
 # ============================================================
-inter_core_pipeline = InterCorePipeline.DEFAULT
+inter_core_pipeline = InterCorePipeline.PRELOAD
 # inter_core_pipeline = InterCorePipeline.PRELOAD
 # inter_core_pipeline = InterCorePipeline.N_BUFFER
 # inter_core_pipeline = InterCorePipeline.DEFAULT
