@@ -117,7 +117,7 @@ STORE_UNITS = {
     "L1 Buffer": {
         "大小": "512 KB",
         "槽位": "由 核内流水 决定",
-        "缓冲区名称": "MTE2A / MTE2B (原L1A / L1B)",
+        "用途": "存Q/K/V/P(V1搬回)",
     },
     "L0A Buffer (MTE1A)": {
         "大小": "64 KB",
@@ -131,7 +131,7 @@ STORE_UNITS = {
     },
     "L0C Buffer": {
         "大小": "64 KB",
-        "槽位": "由 L0c_db 决定",
+        "槽位": "由 L0c_db 决定，基本块大小符合规则默认开启",
         "输出类型": "恒为FP32 (4 bytes/element)"
     },
 }
@@ -161,6 +161,23 @@ STORE_UNITS = {
 
 5. CUBE和VECTOR核间，每个基本块的C1V1C2V2都是有依赖关系的，不同基本块之间的C1V1C2V2没有依赖关系。
 6. 所有组件之间如果没有依赖关系均可并行，以最早的时间执行。
+    7. **L0C缓存区管理**：MAC需要等待L0C有足够空间，否则等待FIXPIPE把上一块搬出。
+       - L0C容量：256KB，默认开启doublebuffer（2个128KB槽位）
+       - 基本块大小：`s1×s2×4 bytes（FP32）。
+       -   - MAC启动时调用L0CSlotTracker.allocate()检查空间是否足够。
+       -   - **PRELOAD Workspace管理**：管理UB（256KB）和workspace分配释放。
+       -   - preload1模式：2个workspace，每个64KB；preload2模式：3个workspace，每个64KB。
+       -   - 不同WS间无依赖：即使指令发射有先后，实际流水线应紧密排布。
+       -   -   - 预期效果：连续3个K1K2K3搬运，无间隔。
+    7. L0C缓存区管理：MAC需要等待L0C有足够空间，否则等待FIXPIPE把上一块搬出。
+    - L0C容量：256KB，默认开启doublebuffer（2个128KB槽位）
+    - 基本块大小：s1×s2×4 bytes（FP32）。
+    - MAC启动时调用L0CSlotTracker.allocate()检查空间是否足够。
+    - 7. PRELOAD Workspace管理：管理UB（256KB）和workspace分配释放。
+      - preload1模式：2个workspace，每个64KB。
+      - preload2模式：3个workspace，每个64KB。
+      - 不同WS间无依赖：即使指令发射有先后，实际流水线应紧密排布。
+      - 预期效果：连续3个K1K2K3搬运，无间隔。
 6. L0C输出恒为FP32：FIXPIPE-P搬运大小 = s1×s2×4 bytes；FIXPIPE-O大小 = s1×d×4 bytes。
 
 
@@ -168,16 +185,16 @@ STORE_UNITS = {
 ### 4.1 DN模式支持
 
 **标准模式路径**:
-- Q → MTE2A → MTE1A (L0A)
-- K → MTE2B → MTE1B (L0B)
-- V → MTE2B → MTE1B (L0B)
-- P → MTE3 → MTE2A(L1) → MTE1A (L0A)
+- Q (GM/L2cache) → MTE2(L1) → MTE1A (L0A)
+- K (GM/L2cache) → MTE2(L1) → MTE1B (L0B)
+- V (GM/L2cache) → MTE2(L1) → MTE1B (L0B)
+- P (UB) → MTE3(L1) → MTE1A (L0A)
 
 **DN模式路径**:
-- Q → MTE2B → MTE1B (L0B)
-- K → MTE2A → MTE1A (L0A)
-- V → MTE2A → MTE1A (L0A)
-- P → MTE3 → MTE2B(L1) → MTE1B (L0B)
+- Q (GM/L2cache) → MTE2(L1) → MTE1A (L0B)
+- K (GM/L2cache) → MTE2(L1) → MTE1B (L0A)
+- V (GM/L2cache) → MTE2(L1) → MTE1B (L0B)
+- P (UB) → MTE3(L1) → MTE1A (L0A)
 
 ### 4.2 核间流水
 实际执行时默认为顺序流水，可以根据输入标志不同进行选择
@@ -186,13 +203,22 @@ STORE_UNITS = {
 **执行顺序**: C1V1C2V2 -> C1V1C2V2 ->... -> C1V1C2V2 -> C1V1C2V2
 
 2. Preload流水
-Preload = 1
 
-**执行顺序**: C1 -> C1V1C2 -> C1V1C2V2 -> C1V1C2V2 -> ... -> V1C2V2 -> C2V2 -> V2
+preload = 1
+**执行顺序**:C1 -> C1V1C2 -> C1V1C2V2 -> C1V1C2V2 -> ... -> V1C2V2 -> C2V2 -> V2
+task0: C1a -> WS1
+task1: C1b -> WS2 V1a C2a -> WS1
+task2:V2a -> OUT，释放WS1, C1c WS1 V1b C2b ->WS2
+task3:V2b ->OUT，释放WS2, C1d ->WS2 V1c C2c ->WS1 依次循环
 
-3. N-Bufer流水
-N=2
-**执行顺序**: C1C1V1V1C2C2V2V2 -> C1C1V1V1C2C2V2V2 -> ... -> C1C1V1V1C2C2V2V2
+preload = 2
+**执行顺序**: C1V1 -> C1V1 -> C1V1C2V2 -> C1V1C2V2 -> ... -> C1V1C2V2 -> C2V2 -> C2V2
+task0: C1a -> V1a -> 占用WS1
+task1: C1b -> V1b -> 占用WS2
+task2: C1c -> V1c -> 占用WS3 C2a ->V2a ->OUT，释放WS1
+task3: C1d -> V1d ->占用WS1 C2b ->V2b->OUT，释放WS2
+task4: C1e -> V1e -> 占用WS2 C2c->V2c ->OUT，释放WS3
+task4: C1f -> V1f -> 占用WS3 C2d ->V2d->OUT，释放WS1 依次循环
 
 ### 4.3 核内流水
 支持两种策略（inner_core_pipeline 参数）：
@@ -360,19 +386,7 @@ modeler_preload = C1Modeler(
     baseM_C2=128, baseN_C2=128, baseK_C2=128,
     q_data_type=DataType.FP16,
     kv_data_type=DataType.FP16,
-    inter_core_pipeline=InterCorePipeline.PRELOAD,
-    inner_core_pipeline=InnerCorePipeline.DEFAULT,
-)
-
-# N_BUFFER 流水（N=2批次）
-modeler_nbuffer = C1Modeler(
-    s1_total=256, s2_total=512, d_total=256,
-    s1_base_size=128, s2_base_size=128, d_base_size=256,
-    baseM_C1=128, baseN_C1=128, baseK_C1=128,
-    baseM_C2=128, baseN_C2=128, baseK_C2=128,
-    q_data_type=DataType.FP8,
-    kv_data_type=DataType.FP8,
-    inter_core_pipeline=InterCorePipeline.N_BUFFER,
+    inter_core_pipeline=InterCorePipeline.PRELOAD_1,
     inner_core_pipeline=InnerCorePipeline.DEFAULT,
 )
 ```
