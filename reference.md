@@ -134,6 +134,12 @@ STORE_UNITS = {
         "槽位": "由 L0c_db 决定，基本块大小符合规则默认开启",
         "输出类型": "恒为FP32 (4 bytes/element)"
     },
+    "UB Buffer": {
+        "大小": "256 KB",
+        "槽位": "即Workspace，由核间流水决定，默认流水1个Workspace=128KB，preload=1 2个64KB的Workspace， preload=2 3个64KB的Workspace",
+        "用途": "存P(C1结束搬入，V1结束搬出)/O(C2搬入，V2结束释放)",
+        "输出类型": "V1阶段取决于Q/K的DataType"
+    },
 }
 ```
 ### 3.3 搬运及计算约束
