@@ -1,6 +1,8 @@
 """
 时间线可视化工具
 """
+import os
+from pathlib import Path
 import matplotlib
 matplotlib.use('Agg')  # 非交互后端，避免 WSL 环境下 Qt/Wayland 报错
 import matplotlib.pyplot as plt
@@ -119,6 +121,10 @@ class TimelineVisualizer:
             ax.legend(handles=handles, loc='upper right')
 
             plt.tight_layout()
+
+            output_path = Path(filename)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+
             plt.savefig(filename, dpi=150)
             print(f"图表已保存: {filename}")
             plt.close()
