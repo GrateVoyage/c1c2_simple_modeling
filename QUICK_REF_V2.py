@@ -36,10 +36,9 @@ from core import DataType, InterCorePipeline, InnerCorePipeline
 #   FIXPIPE 输出大小恒为 FP32（与数据类型无关）
 #
 # 核间流水（inter_core_pipeline）
-#   DEFAULT   顺序: C1V1C2V2 → C1V1C2V2 → ...
-#   PRELOAD   渐进: V 在 K 加载后立即预取，与 C1/V1 并行
-#             可选 two_buffer=True 让 V 使用独立 L1 slot
-#   N_BUFFER  批次: C1C1 → V1V1 → C2C2 → V2V2 → ...
+#   DEFAULT    顺序: C1V1C2V2 → C1V1C2V2 → ...
+#   PRELOAD_1  渐进(2WS): C1[k] 与前一轮 V1C2V2 并行；UB 2个64KB Workspace
+#   PRELOAD_2  渐进(3WS): V1 紧跟 C1，C2 延迟 2 个 K；UB 3个64KB Workspace
 #
 # 存储策略
 #   is_l2cache  重复加载同一块用 L2 带宽（否则用 DRAM）
@@ -69,8 +68,8 @@ def demo_default():
     return total_cycles
 
 
-def demo_preload():
-    """PRELOAD 渐进式流水 — V 与 C1/V1 并行"""
+def demo_preload1():
+    """PRELOAD_1 渐进式流水(2WS) — C1[k] 与前一轮 V1C2V2 并行"""
     modeler = C1Modeler(
         s1_total=256, s2_total=512, d_total=128,
         s1_base_size=128, s2_base_size=256, d_base_size=128,
@@ -79,17 +78,16 @@ def demo_preload():
         q_data_type=DataType.FP16,
         kv_data_type=DataType.FP16,
         is_l2cache=True,
-        inter_core_pipeline=InterCorePipeline.PRELOAD,
+        inter_core_pipeline=InterCorePipeline.PRELOAD_1,
         inner_core_pipeline=InnerCorePipeline.DEFAULT,
-        two_buffer=False,
     )
     _, _, unit_times, total_cycles = modeler.run_simulation()
-    print(f"  PRELOAD    总周期: {total_cycles:>10.1f}")
+    print(f"  PRELOAD_1  总周期: {total_cycles:>10.1f}")
     return total_cycles
 
 
-def demo_n_buffer():
-    """N_BUFFER 批次流水 — C1C1→V1V1→C2C2→V2V2"""
+def demo_preload2():
+    """PRELOAD_2 渐进式流水(3WS) — V1 紧跟 C1，C2 延迟 2 个 K"""
     modeler = C1Modeler(
         s1_total=256, s2_total=512, d_total=128,
         s1_base_size=128, s2_base_size=256, d_base_size=128,
@@ -98,11 +96,11 @@ def demo_n_buffer():
         q_data_type=DataType.FP16,
         kv_data_type=DataType.FP16,
         is_l2cache=True,
-        inter_core_pipeline=InterCorePipeline.N_BUFFER,
+        inter_core_pipeline=InterCorePipeline.PRELOAD_2,
         inner_core_pipeline=InnerCorePipeline.DEFAULT,
     )
     _, _, unit_times, total_cycles = modeler.run_simulation()
-    print(f"  N_BUFFER   总周期: {total_cycles:>10.1f}")
+    print(f"  PRELOAD_2  总周期: {total_cycles:>10.1f}")
     return total_cycles
 
 
@@ -149,14 +147,14 @@ if __name__ == "__main__":
     print("=" * 50)
 
     print("\n【核间流水对比】")
-    c_default = demo_default()
-    c_preload  = demo_preload()
-    c_nbuffer  = demo_n_buffer()
-    print(f"\n  PRELOAD vs DEFAULT:  {(c_default - c_preload) / c_default * 100:+.1f}%")
-    print(f"  N_BUFFER vs DEFAULT: {(c_default - c_nbuffer) / c_default * 100:+.1f}%")
+    c_default  = demo_default()
+    c_preload1 = demo_preload1()
+    c_preload2 = demo_preload2()
+    print(f"\n  PRELOAD_1 vs DEFAULT:  {(c_default - c_preload1) / c_default * 100:+.1f}%")
+    print(f"  PRELOAD_2 vs DEFAULT:  {(c_default - c_preload2) / c_default * 100:+.1f}%")
 
     print("\n【数据类型对比】")
-    demo_default()          # FP16+FP16（复用上方结果展示）
+    demo_default()
     demo_fp8()
 
     print("\n【矩阵乘切分】")
@@ -165,5 +163,5 @@ if __name__ == "__main__":
     print("\n更多示例:")
     print("  python examples/run_c1_examples.py      # 各配置+时间线图")
     print("  python examples/test_full_pipeline.py   # 完整流水线事件流")
-    print("  python examples/test_preload.py         # PRELOAD / TWOBUFFER 对比")
+    print("  python examples/test_preload.py         # PRELOAD_1 / PRELOAD_2 对比")
     print("  python -m pytest tests/ -q              # 运行全部测试")

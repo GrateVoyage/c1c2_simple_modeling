@@ -17,7 +17,7 @@ from core import DataType, InterCorePipeline, InnerCorePipeline, LoadOrder
 # 矩阵规模
 # ============================================================
 s1_total     = 128      # Q 的 sequence 长度（总行数），需被 s1_base_size 整除
-s2_total     = 1024     # K/V 的 sequence 长度（总列数），需被 s2_base_size 整除
+s2_total     = 1536     # K/V 的 sequence 长度（总列数），需被 s2_base_size 整除
 d_total      = 128      # 特征维度，需被 d_base_size 整除
 
 # ============================================================
@@ -30,8 +30,8 @@ d_base_size  = 128      # 特征维度块大小
 # ============================================================
 # 数据类型
 # ============================================================
-q_data_type  = DataType.FP16    # Q 矩阵数据类型:  DataType.FP16 / DataType.FP8
-kv_data_type = DataType.FP16    # K/V 矩阵数据类型: DataType.FP16 / DataType.FP8
+q_data_type  = DataType.FP8    # Q 矩阵数据类型:  DataType.FP16 / DataType.FP8
+kv_data_type = DataType.FP8    # K/V 矩阵数据类型: DataType.FP16 / DataType.FP8
 
 # ============================================================
 # 矩阵乘切分（基本块内的 MAC 最大块尺寸）
@@ -41,7 +41,7 @@ kv_data_type = DataType.FP16    # K/V 矩阵数据类型: DataType.FP16 / DataTy
 #   C2 同理，对应 P@V 计算
 # ============================================================
 baseM_C1 = 128      # C1 阶段 MAC 的 M 维最大块（对应 s1_base 方向）
-baseN_C1 = 128      # C1 阶段 MAC 的 N 维最大块（对应 s2_base 方向）
+baseN_C1 = 256      # C1 阶段 MAC 的 N 维最大块（对应 s2_base 方向）
 baseK_C1 = 128      # C1 阶段 MAC 的 K 维最大块（对应 d_base  方向）
 
 baseM_C2 = 128      # C2 阶段 MAC 的 M 维最大块
@@ -77,15 +77,13 @@ load_order = LoadOrder.LOAD_Q_FIRST     # LOAD_Q_FIRST: 先加载 Q 再加载 K
                                         # LOAD_K_FIRST: 先加载 K 再加载 Q
 
 # ============================================================
-# 核间流水线模式（不同 q_block 之间的调度策略）
-#   DEFAULT:  C1V1C2V2 → C1V1C2V2 → ...（顺序执行，等上一个完全结束再开始下一个）
-#   PRELOAD:  C1 → C1V1C2 → C1V1C2V2 → ... → V1C2V2 → C2V2 → V2
-#             （渐进启动：下一个 C1 在当前 MAC 完成后立即发射，不等 V2）
-#   N_BUFFER: C1C1 → V1V1 → C2C2 → V2V2（批量流水，N=2 组同时推进）
+# 核间流水线模式（不同 k_block 之间的调度策略）
+#   DEFAULT:   C1V1C2V2 → C1V1C2V2 → ...（顺序执行）
+#   PRELOAD_1: C1 → C1V1C2 → C1V1C2V2 → ... → V1C2V2（2WS，C2 延迟 1 个 K）
+#   PRELOAD_2: C1V1 → C1V1 → C1V1C2V2 → ...（3WS，V1 紧跟 C1，C2 延迟 2 个 K）
 # ============================================================
-inter_core_pipeline = InterCorePipeline.PRELOAD
-# inter_core_pipeline = InterCorePipeline.PRELOAD
-# inter_core_pipeline = InterCorePipeline.N_BUFFER
+inter_core_pipeline = InterCorePipeline.PRELOAD_2
+# inter_core_pipeline = InterCorePipeline.PRELOAD_2
 # inter_core_pipeline = InterCorePipeline.DEFAULT
 
 # ============================================================

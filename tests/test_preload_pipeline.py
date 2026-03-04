@@ -15,27 +15,29 @@ def make_modeler(pipeline):
     )
 
 def test_preload_runs():
-    m = make_modeler(InterCorePipeline.PRELOAD)
+    m = make_modeler(InterCorePipeline.PRELOAD_1)
     _, _, _, total = m.run_simulation()
     assert total > 0
 
-def test_preload_v_loaded_in_c2_phase():
+def test_preload_v_loaded_before_mac_o():
     """
-    PRELOAD core: V should be loaded during C2 phase (after V1 ends).
-    MTE2-V events should start AFTER the corresponding VECTOR_V1 ends.
+    PRELOAD: MTE2-V 可以在 V1 完成前就开始（MTE2-V 只依赖 MTE2 单元和 L1 槽位，
+    与 P 的处理无关）。真正的约束是：MTE2-V 必须在对应的 MAC-O 之前完成。
     """
-    m = make_modeler(InterCorePipeline.PRELOAD)
+    m = make_modeler(InterCorePipeline.PRELOAD_1)
     timeline, _, _, _ = m.run_simulation()
-    mte2_v = [e for e in timeline if e.unit == "MTE2" and "V" in e.operation]
-    v1_events = [e for e in timeline if e.unit == "VECTOR_V1"]
+    mte2_v = sorted([e for e in timeline if e.unit == "MTE2" and "V" in e.operation],
+                    key=lambda e: e.start_time)
+    mac_o  = sorted([e for e in timeline if e.unit == "MAC" and e.operation == "O"],
+                    key=lambda e: e.start_time)
     assert len(mte2_v) > 0, "Should have MTE2 V events"
-    assert len(v1_events) > 0, "Should have VECTOR_V1 events"
-    # In PRELOAD mode, V loads in C2 (after p_ready_time which is end of V1)
-    # The first MTE2-V event starts at or after the first V1 ends
-    assert mte2_v[0].start_time >= v1_events[0].end_time, (
-        f"V should be loaded after V1 ends (C2 phase): "
-        f"MTE2-V start={mte2_v[0].start_time:.1f}, V1 end={v1_events[0].end_time:.1f}"
-    )
+    assert len(mac_o) > 0, "Should have MAC-O events"
+    # MTE2-V 必须在 MAC-O 开始前完成（V 须进入 L0 才能做矩阵乘）
+    for i, (v_evt, mac_evt) in enumerate(zip(mte2_v, mac_o)):
+        assert v_evt.end_time <= mac_evt.start_time + 1e-9, (
+            f"MTE2-V[{i}] must finish before MAC-O[{i}] starts: "
+            f"MTE2-V end={v_evt.end_time:.1f}, MAC-O start={mac_evt.start_time:.1f}"
+        )
 
 def test_preload_mte2_v_count():
     """
@@ -43,7 +45,7 @@ def test_preload_mte2_v_count():
     Total MTE2-V events == number of k blocks.
     For 1 q_block x 2 k_blocks: exactly 2 MTE2-V events total.
     """
-    m = make_modeler(InterCorePipeline.PRELOAD)
+    m = make_modeler(InterCorePipeline.PRELOAD_1)
     timeline, _, _, _ = m.run_simulation()
     mte2_v = [e for e in timeline if e.unit == "MTE2" and "V" in e.operation]
     k_block_count = 512 // 256  # = 2
@@ -55,7 +57,7 @@ def test_preload_mte2_v_count():
 def test_preload_faster_than_default():
     """PRELOAD should be faster than DEFAULT (C1 overlaps with previous C2)"""
     m_default = make_modeler(InterCorePipeline.DEFAULT)
-    m_preload = make_modeler(InterCorePipeline.PRELOAD)
+    m_preload = make_modeler(InterCorePipeline.PRELOAD_1)
     _, _, _, t_default = m_default.run_simulation()
     _, _, _, t_preload = m_preload.run_simulation()
     assert t_preload < t_default, (
@@ -68,7 +70,7 @@ def test_preload_c1_overlaps_with_previous_c2():
     In PRELOAD mode, C1[k+1] MAC should start before C2[k] completes.
     Verify that the second MAC-P event starts before the first MAC-O event ends.
     """
-    m = make_modeler(InterCorePipeline.PRELOAD)
+    m = make_modeler(InterCorePipeline.PRELOAD_1)
     timeline, _, _, _ = m.run_simulation()
     mac_p_events = [e for e in timeline if e.unit == "MAC" and e.operation == "P"]
     mac_o_events = [e for e in timeline if e.unit == "MAC" and e.operation == "O"]

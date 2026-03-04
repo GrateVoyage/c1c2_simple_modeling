@@ -136,7 +136,7 @@ STORE_UNITS = {
     },
     "UB Buffer": {
         "大小": "256 KB",
-        "槽位": "即Workspace，由核间流水决定，默认流水1个Workspace=128KB，preload=1 2个64KB的Workspace， preload=2 3个64KB的Workspace",
+        "槽位": "即Workspace，由核间流水决定。DEFAULT=1个128KB Workspace；PRELOAD_1=2个64KB Workspace；PRELOAD_2=3个64KB Workspace",
         "用途": "存P(C1结束搬入，V1结束搬出)/O(C2搬入，V2结束释放)",
         "输出类型": "V1阶段取决于Q/K的DataType"
     },
@@ -165,26 +165,17 @@ STORE_UNITS = {
      - 生产者等消费者：
      MTE1_MTE3、MTE1_MTE2、FIXPIPE_MAC、MAC_MTE1
 
-5. CUBE和VECTOR核间，每个基本块的C1V1C2V2都是有依赖关系的，不同基本块之间的C1V1C2V2没有依赖关系。
-6. 所有组件之间如果没有依赖关系均可并行，以最早的时间执行。
-    7. **L0C缓存区管理**：MAC需要等待L0C有足够空间，否则等待FIXPIPE把上一块搬出。
-       - L0C容量：256KB，默认开启doublebuffer（2个128KB槽位）
-       - 基本块大小：`s1×s2×4 bytes（FP32）。
-       -   - MAC启动时调用L0CSlotTracker.allocate()检查空间是否足够。
-       -   - **PRELOAD Workspace管理**：管理UB（256KB）和workspace分配释放。
-       -   - preload1模式：2个workspace，每个64KB；preload2模式：3个workspace，每个64KB。
-       -   - 不同WS间无依赖：即使指令发射有先后，实际流水线应紧密排布。
-       -   -   - 预期效果：连续3个K1K2K3搬运，无间隔。
-    7. L0C缓存区管理：MAC需要等待L0C有足够空间，否则等待FIXPIPE把上一块搬出。
-    - L0C容量：256KB，默认开启doublebuffer（2个128KB槽位）
-    - 基本块大小：s1×s2×4 bytes（FP32）。
-    - MAC启动时调用L0CSlotTracker.allocate()检查空间是否足够。
-    - 7. PRELOAD Workspace管理：管理UB（256KB）和workspace分配释放。
-      - preload1模式：2个workspace，每个64KB。
-      - preload2模式：3个workspace，每个64KB。
-      - 不同WS间无依赖：即使指令发射有先后，实际流水线应紧密排布。
-      - 预期效果：连续3个K1K2K3搬运，无间隔。
-6. L0C输出恒为FP32：FIXPIPE-P搬运大小 = s1×s2×4 bytes；FIXPIPE-O大小 = s1×d×4 bytes。
+6. CUBE和VECTOR核间，每个基本块的C1V1C2V2都是有依赖关系的，不同基本块之间的C1V1C2V2没有依赖关系。
+7. 所有组件之间如果没有依赖关系均可并行，以最早的时间执行。  
+8. **L0C缓冲区管理**：MAC 启动前须等待 L0C 有空闲槽位（doublebuffer 2槽，每槽存1个完整基本块）。
+- L0C doublebuffer：2 个槽位，由 `L0CSlotTracker` 追踪。
+- MAC 启动时调用 `L0CSlotTracker.allocate()` 拿槽，FIXPIPE 完成后 `release()`。
+- matmulN/matmulK 的所有 sub-MAC 共用同一槽（分配一次，最后 FIXPIPE 后释放）。
+- **PRELOAD Workspace 管理**：由 `UBWorkspaceTracker` 追踪 UB 中的 64KB Workspace 槽。
+    - PRELOAD_1 模式：2个 Workspace；PRELOAD_2 模式：3个 Workspace。
+    - WS 从 FIXPIPE-P 写入时占用，V2 完成后释放。
+    - `allocate()` 返回值作为 C1 阶段 MTE2 开始时间的下界（ws_avail_time）。
+9. L0C输出恒为FP32：FIXPIPE-P搬运大小 = s1×s2×4 bytes；FIXPIPE-O大小 = s1×d×4 bytes。
 
 
 ## 4. 模式特性支持
@@ -204,27 +195,27 @@ STORE_UNITS = {
 
 ### 4.2 核间流水
 实际执行时默认为顺序流水，可以根据输入标志不同进行选择
-1. 顺序流水(默认情况)
+1. 顺序流水(DEFAULT)
 
 **执行顺序**: C1V1C2V2 -> C1V1C2V2 ->... -> C1V1C2V2 -> C1V1C2V2
 
-2. Preload流水
+2. 渐进流水
 
-preload = 1
+PRELOAD_1（2WS）
 **执行顺序**:C1 -> C1V1C2 -> C1V1C2V2 -> C1V1C2V2 -> ... -> V1C2V2 -> C2V2 -> V2
 task0: C1a -> WS1
 task1: C1b -> WS2 V1a C2a -> WS1
 task2:V2a -> OUT，释放WS1, C1c WS1 V1b C2b ->WS2
 task3:V2b ->OUT，释放WS2, C1d ->WS2 V1c C2c ->WS1 依次循环
 
-preload = 2
+PRELOAD_2（3WS）
 **执行顺序**: C1V1 -> C1V1 -> C1V1C2V2 -> C1V1C2V2 -> ... -> C1V1C2V2 -> C2V2 -> C2V2
 task0: C1a -> V1a -> 占用WS1
 task1: C1b -> V1b -> 占用WS2
 task2: C1c -> V1c -> 占用WS3 C2a ->V2a ->OUT，释放WS1
 task3: C1d -> V1d ->占用WS1 C2b ->V2b->OUT，释放WS2
 task4: C1e -> V1e -> 占用WS2 C2c->V2c ->OUT，释放WS3
-task4: C1f -> V1f -> 占用WS3 C2d ->V2d->OUT，释放WS1 依次循环
+task5: C1f -> V1f -> 占用WS3 C2d ->V2d->OUT，释放WS1 依次循环
 
 ### 4.3 核内流水
 支持两种策略（inner_core_pipeline 参数）：

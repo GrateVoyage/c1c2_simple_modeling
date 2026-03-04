@@ -111,40 +111,6 @@ def example_custom():
     modeler.print_performance(unit_times, total_cycles)
     modeler.plot_timeline(timeline, unit_times, total_cycles, "outputs/custom_timeline.png")
 
-def example_n_buffer():
-    """N_BUFFER流水线模式示例"""
-    print("\n" + "="*60)
-    print("示例5: N_BUFFER流水线模式 (C1C1→V1V1→C2C2→V2V2)")
-    print("="*60)
-
-    modeler = C1Modeler(
-        s1_total=256,
-        s2_total=1024,
-        d_total=128,
-        s1_base_size=128,
-        s2_base_size=256,
-        d_base_size=128,
-        q_data_type=DataType.FP16,
-        kv_data_type=DataType.FP16,
-        baseM_C1=128,
-        baseN_C1=128,
-        baseK_C1=128,
-        baseM_C2=128,
-        baseN_C2=128,
-        baseK_C2=128,
-        use_dn=False,
-        L1_db=False,
-        L0_db=False,
-        is_l2cache=True,
-        full_load=False,
-        inter_core_pipeline=InterCorePipeline.N_BUFFER,
-        inner_core_pipeline=InnerCorePipeline.DEFAULT,
-    )
-
-    timeline, bound_type, unit_times, total_cycles = modeler.run_simulation()
-    modeler.print_performance(unit_times, total_cycles)
-    modeler.plot_timeline(timeline, unit_times, total_cycles, "outputs/n_buffer_timeline.png")
-
 def main():
     """运行所有示例"""
     print("C1建模器示例集")
@@ -154,7 +120,6 @@ def main():
     example_dn_mode()
     example_full_load()
     example_custom()
-    example_n_buffer()
 
     print("\n" + "="*60)
     print("所有示例运行完成!")

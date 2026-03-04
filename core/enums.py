@@ -22,9 +22,9 @@ class LoadOrder(Enum):
 
 class InterCorePipeline(Enum):
     """核间流水线模式"""
-    DEFAULT  = "default"    # 顺序流水: C1V1C2V2 → C1V1C2V2 → ...
-    PRELOAD  = "preload"    # 渐进式:   V在K加载后立即预加载，C2省去V的MTE2等待
-    N_BUFFER = "n_buffer"   # N=2批次:  C1C1→V1V1→C2C2→V2V2
+    DEFAULT   = "default"    # 顺序流水: C1V1C2V2 → C1V1C2V2 → ...
+    PRELOAD_1 = "preload_1"  # 渐进式(2WS): V在K加载后预加载，C2延迟1个K
+    PRELOAD_2 = "preload_2"  # 渐进式(3WS): V1紧跟C1，C2延迟2个K
 
 class InnerCorePipeline(Enum):
     """核内流水线模式"""
