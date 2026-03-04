@@ -136,8 +136,9 @@ STORE_UNITS = {
     },
     "UB Buffer": {
         "大小": "256 KB",
-        "槽位": "即Workspace，由核间流水决定。DEFAULT=1个128KB Workspace；PRELOAD_1=2个64KB Workspace；PRELOAD_2=3个64KB Workspace",
-        "用途": "存P(C1结束搬入，V1结束搬出)/O(C2搬入，V2结束释放)",
+        "槽位": "由核间流水决定。DEFAULT=1个128KB Workspace；PRELOAD_1=UB_C1/UB_C2各2槽；PRELOAD_2=UB_C1/UB_C2各2槽",
+        "L1_P槽": "PRELOAD_1=2槽，PRELOAD_2=3槽（追踪P矩阵在L1的存放位置）",
+        "用途": "存P(C1结束搬入，MTE3搬出)/O(C2搬入，V2结束释放)",
         "输出类型": "V1阶段取决于Q/K的DataType"
     },
 }
@@ -171,10 +172,11 @@ STORE_UNITS = {
 - L0C doublebuffer：2 个槽位，由 `L0CSlotTracker` 追踪。
 - MAC 启动时调用 `L0CSlotTracker.allocate()` 拿槽，FIXPIPE 完成后 `release()`。
 - matmulN/matmulK 的所有 sub-MAC 共用同一槽（分配一次，最后 FIXPIPE 后释放）。
-- **PRELOAD Workspace 管理**：由 `UBWorkspaceTracker` 追踪 UB 中的 64KB Workspace 槽。
-    - PRELOAD_1 模式：2个 Workspace；PRELOAD_2 模式：3个 Workspace。
-    - WS 从 FIXPIPE-P 写入时占用，V2 完成后释放。
-    - `allocate()` 返回值作为 C1 阶段 MTE2 开始时间的下界（ws_avail_time）。
+- **PRELOAD Workspace 管理**：使用三个独立追踪器管理 PRELOAD 模式下的缓冲区槽位。
+    - `L1PSlotTracker`：追踪 P 矩阵写入 L1 的槽位（PRELOAD_1: 2槽，PRELOAD_2: 3槽）。MTE3 写入 L1 前占用（约束 MTE3 开始时间），MTE1-P 完成后（P 已搬到 L0）释放。
+    - `UBSlotTracker`（C1 实例）：追踪 FIXPIPE-P 写入 UB 的槽位（固定 2 槽）。FIXPIPE-P 写入时占用（约束 FIXPIPE-P 开始时间），MTE3 完成后（P 已从 UB 搬出）释放。
+    - `UBSlotTracker`（C2 实例）：追踪 FIXPIPE-O 写入 UB 的槽位（固定 2 槽）。FIXPIPE-O 写入时占用（约束 FIXPIPE-O 开始时间），V2 完成后释放。
+    - MTE2-K 不受 UB 槽约束，其开始时间仅由 MTE2 资源空闲时间和 L1 槽 `mte2_free` 决定（见第4条）。
 9. L0C输出恒为FP32：FIXPIPE-P搬运大小 = s1×s2×4 bytes；FIXPIPE-O大小 = s1×d×4 bytes。
 
 

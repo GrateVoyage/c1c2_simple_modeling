@@ -28,25 +28,44 @@ class L0CSlotTracker:
         self.slot_free_times[slot_idx] = release_time
 
 
-class UBWorkspaceTracker:
-    """UB Workspace 追踪器（PRELOAD_1: 2WS，PRELOAD_2: 3WS，各64KB）。
+class L1PSlotTracker:
+    """L1 P矩阵槽位追踪器（PRELOAD_1: 2槽，PRELOAD_2: 3槽）。
 
-    WS 从 FIXPIPE-P 写入时占用，到 V2 完成时释放。
-    allocate 返回的 actual_start 作为 C1 阶段 MTE2 开始时间的下界。
+    槽位在 MTE3 写入 L1 前占用（约束 MTE3 开始时间），MTE1-P 完成后（P 已搬到 L0）释放。
     """
 
-    def __init__(self, n_ws: int):
-        self.n_ws = n_ws
-        self.ws_free_times: List[float] = [0.0] * n_ws
+    def __init__(self, n_slots: int):
+        self.n_slots = n_slots
+        self.slot_free_times: List[float] = [0.0] * n_slots
 
     def allocate(self, desired_start: float) -> Tuple[int, float]:
-        """找最早可用 WS，返回 (ws_idx, actual_start)"""
-        best = min(range(self.n_ws), key=lambda i: self.ws_free_times[i])
-        return best, max(desired_start, self.ws_free_times[best])
+        """找最早可用槽位，返回 (slot_idx, actual_start)"""
+        best = min(range(self.n_slots), key=lambda i: self.slot_free_times[i])
+        return best, max(desired_start, self.slot_free_times[best])
 
-    def release(self, ws_idx: int, release_time: float) -> None:
-        """V2 完成时释放 WS"""
-        self.ws_free_times[ws_idx] = release_time
+    def release(self, slot_idx: int, release_time: float) -> None:
+        """MTE1-P 完成后释放槽位"""
+        self.slot_free_times[slot_idx] = release_time
+
+
+class UBSlotTracker:
+    """UB 双缓冲槽位追踪器（固定2槽，PRELOAD 模式下 C1/C2 各一个实例）。
+
+    C1 实例：FIXPIPE-P 写入时占用，MTE3 完成后释放。
+    C2 实例：FIXPIPE-O 写入时占用，V2 完成后释放。
+    """
+
+    def __init__(self):
+        self.slot_free_times: List[float] = [0.0, 0.0]
+
+    def allocate(self, desired_start: float) -> Tuple[int, float]:
+        """找最早可用槽位，返回 (slot_idx, actual_start)"""
+        best = min(range(2), key=lambda i: self.slot_free_times[i])
+        return best, max(desired_start, self.slot_free_times[best])
+
+    def release(self, slot_idx: int, release_time: float) -> None:
+        """释放槽位"""
+        self.slot_free_times[slot_idx] = release_time
 
 
 class L1CacheTracker:
@@ -364,7 +383,7 @@ class C1Modeler:
 
     def _calc_vector_v1_cycles(self) -> float:
         """计算Vector V1处理周期数 (Softmax等操作)"""
-        return 1800.0
+        return 500.0
 
     def _calc_vector_v2_cycles(self) -> float:
         """计算Vector V2处理周期数 (后处理操作)"""
@@ -422,9 +441,9 @@ class C1Modeler:
 
         # 主循环：根据inter_core_pipeline模式选择不同的执行策略
         if self.inter_core_pipeline == InterCorePipeline.PRELOAD_1:
-            # PRELOAD_1: 2WS 渐进式流水，C2 延迟 1 个 K
+            # PRELOAD_1: 2个L1_P槽 + UB C1/C2 双缓冲，C2 延迟 1 个 K
             # 序列: C1[0] -> C1[1]+V1C2[0] -> C1[2]+V1C2[1]V2[0] -> ...
-            print(f"PRELOAD_1模式: 2WS UB Workspace，C2 延迟 1 个 K")
+            print(f"PRELOAD_1模式: 2个L1_P槽，UB C1/C2 双缓冲，C2 延迟 1 个 K")
 
             for q_idx in range(self.q_block_count):
                 self._load_q_block(
@@ -432,19 +451,21 @@ class C1Modeler:
                     q_l1_ready_times, q_l0_ready_times, l1_cache
                 )
 
-                ws_tracker = UBWorkspaceTracker(n_ws=2)
-                c1_fix_ends = []   # 保存每个 k_idx 的 end_fix_p
-                ws_indices  = []   # 保存每个 k_idx 对应的 WS 槽
+                l1p_tracker  = L1PSlotTracker(n_slots=2)
+                ub_c1_tracker = UBSlotTracker()
+                ub_c2_tracker = UBSlotTracker()
+                c1_fix_ends  = []   # 保存每个 k_idx 的 end_fix_p
+                ub_c1_slots  = []   # 保存每个 k_idx 对应的 UB_C1 槽
 
                 for k_idx in range(self.k_block_count):
-                    # 分配 WS（ws_avail 作为 C1 MTE2 的最早开始时间下界）
-                    ws_idx, ws_avail = ws_tracker.allocate(0.0)
-                    ws_indices.append(ws_idx)
+                    # 为 C1[k] 分配 UB_C1 槽（约束 FIXPIPE-P 开始时间）
+                    ub_c1_slot, ub_c1_avail = ub_c1_tracker.allocate(0.0)
+                    ub_c1_slots.append(ub_c1_slot)
 
                     # 立即发射 C1[k]
                     end_fix_p = self._process_c1_only(
                         q_idx, k_idx, map_k, resource_free_time, q_l0_ready_times,
-                        l1_cache, l0c_tracker, ws_avail_time=ws_avail
+                        l1_cache, l0c_tracker, ub_c1_avail_time=ub_c1_avail
                     )
                     c1_fix_ends.append(end_fix_p)
 
@@ -454,11 +475,13 @@ class C1Modeler:
                         end_v1 = self._process_v1_only(
                             q_idx, prev, resource_free_time, c1_fix_ends[prev]
                         )
-                        end_v2 = self._process_c2_stage(
+                        self._process_c2_stage(
                             q_idx, prev, map_q, map_k, resource_free_time, end_v1,
-                            l1_cache, l0c_tracker
+                            l1_cache, l0c_tracker,
+                            l1p_tracker=l1p_tracker,
+                            ub_c1_tracker=ub_c1_tracker, ub_c1_slot=ub_c1_slots[prev],
+                            ub_c2_tracker=ub_c2_tracker,
                         )
-                        ws_tracker.release(ws_indices[prev], end_v2)
 
                 # 收尾：最后一个 k 的 V1 + C2 + V2
                 if self.k_block_count > 0:
@@ -466,16 +489,18 @@ class C1Modeler:
                     end_v1 = self._process_v1_only(
                         q_idx, last, resource_free_time, c1_fix_ends[last]
                     )
-                    end_v2 = self._process_c2_stage(
+                    self._process_c2_stage(
                         q_idx, last, map_q, map_k, resource_free_time, end_v1,
-                        l1_cache, l0c_tracker
+                        l1_cache, l0c_tracker,
+                        l1p_tracker=l1p_tracker,
+                        ub_c1_tracker=ub_c1_tracker, ub_c1_slot=ub_c1_slots[last],
+                        ub_c2_tracker=ub_c2_tracker,
                     )
-                    ws_tracker.release(ws_indices[last], end_v2)
         elif self.inter_core_pipeline == InterCorePipeline.PRELOAD_2:
-            # PRELOAD_2: 3WS 渐进式流水，V1 紧跟 C1，C2 延迟 2 个 K
+            # PRELOAD_2: 3个L1_P槽 + UB C1/C2 双缓冲，V1 紧跟 C1，C2 延迟 2 个 K
             # 序列: C1[0]+V1[0] -> C1[1]+V1[1] -> C1[2]+V1[2]+C2[0] -> ...
-            print(f"PRELOAD_2模式: 3WS UB Workspace，V1 紧跟 C1，C2 延迟 2 个 K")
-            c2_delay = 2  # n_ws - 1
+            print(f"PRELOAD_2模式: 3个L1_P槽，UB C1/C2 双缓冲，V1 紧跟 C1，C2 延迟 2 个 K")
+            c2_delay = 2  # n_slots - 1
 
             for q_idx in range(self.q_block_count):
                 self._load_q_block(
@@ -483,20 +508,22 @@ class C1Modeler:
                     q_l1_ready_times, q_l0_ready_times, l1_cache
                 )
 
-                ws_tracker = UBWorkspaceTracker(n_ws=3)
-                c1_fix_ends = []   # 每个 k 的 end_fix_p
-                v1_end_times = []  # 每个 k 的 end_vector_v1
-                ws_indices   = []  # 每个 k 对应的 WS 槽
+                l1p_tracker  = L1PSlotTracker(n_slots=3)
+                ub_c1_tracker = UBSlotTracker()
+                ub_c2_tracker = UBSlotTracker()
+                c1_fix_ends  = []   # 每个 k 的 end_fix_p
+                v1_end_times = []   # 每个 k 的 end_vector_v1
+                ub_c1_slots  = []   # 每个 k 对应的 UB_C1 槽
 
                 for k_idx in range(self.k_block_count):
-                    # 分配 WS
-                    ws_idx, ws_avail = ws_tracker.allocate(0.0)
-                    ws_indices.append(ws_idx)
+                    # 为 C1[k] 分配 UB_C1 槽
+                    ub_c1_slot, ub_c1_avail = ub_c1_tracker.allocate(0.0)
+                    ub_c1_slots.append(ub_c1_slot)
 
                     # 发射 C1[k]
                     end_fix_p = self._process_c1_only(
                         q_idx, k_idx, map_k, resource_free_time, q_l0_ready_times,
-                        l1_cache, l0c_tracker, ws_avail_time=ws_avail
+                        l1_cache, l0c_tracker, ub_c1_avail_time=ub_c1_avail
                     )
                     c1_fix_ends.append(end_fix_p)
 
@@ -509,19 +536,23 @@ class C1Modeler:
                     # 发射延迟 c2_delay 个 K 之前的 C2[k - c2_delay]
                     c2_k = k_idx - c2_delay
                     if c2_k >= 0:
-                        end_v2 = self._process_c2_stage(
+                        self._process_c2_stage(
                             q_idx, c2_k, map_q, map_k, resource_free_time,
-                            v1_end_times[c2_k], l1_cache, l0c_tracker
+                            v1_end_times[c2_k], l1_cache, l0c_tracker,
+                            l1p_tracker=l1p_tracker,
+                            ub_c1_tracker=ub_c1_tracker, ub_c1_slot=ub_c1_slots[c2_k],
+                            ub_c2_tracker=ub_c2_tracker,
                         )
-                        ws_tracker.release(ws_indices[c2_k], end_v2)
 
                 # 收尾：最后 c2_delay 个 k 的 C2 + V2
                 for tail in range(max(0, self.k_block_count - c2_delay), self.k_block_count):
-                    end_v2 = self._process_c2_stage(
+                    self._process_c2_stage(
                         q_idx, tail, map_q, map_k, resource_free_time,
-                        v1_end_times[tail], l1_cache, l0c_tracker
+                        v1_end_times[tail], l1_cache, l0c_tracker,
+                        l1p_tracker=l1p_tracker,
+                        ub_c1_tracker=ub_c1_tracker, ub_c1_slot=ub_c1_slots[tail],
+                        ub_c2_tracker=ub_c2_tracker,
                     )
-                    ws_tracker.release(ws_indices[tail], end_v2)
         else:
             # 正常模式：C1V1C2V2流水线连续执行
             for q_idx in range(self.q_block_count):
@@ -861,7 +892,7 @@ class C1Modeler:
     def _process_c1_only(
         self, q_idx: int, k_idx: int, map_k: Dict, resource_free_time: Dict,
         q_l0_ready_times: Dict, l1_cache: L1CacheTracker, l0c_tracker: 'L0CSlotTracker',
-        ws_avail_time: float = 0.0
+        ub_c1_avail_time: float = 0.0
     ) -> float:
         """执行C1阶段（K加载 + MAC-P + FIXPIPE-P），不包含VECTOR_V1，返回end_fix_p"""
         l1_name_k = map_k['l1']
@@ -878,10 +909,8 @@ class C1Modeler:
         if split_type == 'N':
             sub_n = self.baseN_C1
             last_mac_end_c1 = 0.0
-            # ONE MTE2 for full K block（受 ws_avail_time 约束）
+            # ONE MTE2 for full K block
             size_k_full = self._calc_k_size()
-            # 将 ws_avail_time 作为 L1 slot 的 mte2_free 下界
-            l1_slots_k[slot_l1_k]['mte2_free'] = max(l1_slots_k[slot_l1_k]['mte2_free'], ws_avail_time)
             end_l1_k = self._mte2_to_l1(
                 f"K{k_idx}", size_k_full, use_l2_for_k,
                 l1_name_k, l1_slots_k, slot_l1_k, resource_free_time, q_idx, k_idx,
@@ -927,7 +956,7 @@ class C1Modeler:
             l1_slots_k[slot_l1_k]['mte1_free'] = resource_free_time["MTE1"]
             size_p_fix = self._calc_fixpipe_p_size()
             dur_fix_p = self._calc_fixpipe_cycles(size_p_fix)
-            start_fix_p = max(resource_free_time["FIXPIPE"], last_mac_end_c1)
+            start_fix_p = max(resource_free_time["FIXPIPE"], last_mac_end_c1, ub_c1_avail_time)
             end_fix_p = start_fix_p + dur_fix_p
             self.timeline.append(TimelineEvent(
                 "FIXPIPE", "P", start_fix_p, end_fix_p, dur_fix_p,
@@ -939,8 +968,6 @@ class C1Modeler:
 
         else:
             size_k = self._calc_k_size()
-            # ws_avail_time 约束第一次 MTE2
-            l1_slots_k[slot_l1_k]['mte2_free'] = max(l1_slots_k[slot_l1_k]['mte2_free'], ws_avail_time)
             end_l1_k = self._mte2_to_l1(
                 f"K{k_idx}", size_k, use_l2_for_k,
                 l1_name_k, l1_slots_k, slot_l1_k, resource_free_time, q_idx, k_idx,
@@ -988,7 +1015,7 @@ class C1Modeler:
 
                 size_p = self._calc_fixpipe_p_size()
                 dur_fix_p = self._calc_fixpipe_cycles(size_p)
-                start_fix_p = max(resource_free_time["FIXPIPE"], last_mac_end_c1)
+                start_fix_p = max(resource_free_time["FIXPIPE"], last_mac_end_c1, ub_c1_avail_time)
                 end_fix_p = start_fix_p + dur_fix_p
                 self.timeline.append(TimelineEvent(
                     "FIXPIPE", "P", start_fix_p, end_fix_p, dur_fix_p,
@@ -1033,7 +1060,7 @@ class C1Modeler:
 
                 size_p = self._calc_fixpipe_p_size()
                 dur_fix_p = self._calc_fixpipe_cycles(size_p)
-                start_fix_p = max(resource_free_time["FIXPIPE"], end_mac_c1)
+                start_fix_p = max(resource_free_time["FIXPIPE"], end_mac_c1, ub_c1_avail_time)
                 end_fix_p = start_fix_p + dur_fix_p
                 self.timeline.append(TimelineEvent(
                     "FIXPIPE", "P", start_fix_p, end_fix_p, dur_fix_p,
@@ -1058,10 +1085,24 @@ class C1Modeler:
     def _process_c2_stage(
         self, q_idx: int, k_idx: int, map_q: Dict, map_k: Dict,
         resource_free_time: Dict, p_ready_time: float,
-        l1_cache: L1CacheTracker, l0c_tracker: 'L0CSlotTracker'
+        l1_cache: L1CacheTracker, l0c_tracker: 'L0CSlotTracker',
+        l1p_tracker: Optional['L1PSlotTracker'] = None,
+        ub_c1_tracker: Optional['UBSlotTracker'] = None,
+        ub_c1_slot: Optional[int] = None,
+        ub_c2_tracker: Optional['UBSlotTracker'] = None,
     ) -> float:
-        """执行C2+V2阶段，返回 end_vector_v2（用于 WS 释放）"""
+        """执行C2+V2阶段，返回 end_vector_v2"""
         size_p_mte3 = self._calc_mte3_p_size()
+
+        # L1_P 槽分配（约束 MTE3 开始时间）
+        l1p_slot, l1p_avail = 0, 0.0
+        if l1p_tracker is not None:
+            l1p_slot, l1p_avail = l1p_tracker.allocate(0.0)
+
+        # UB_C2 槽分配（约束 FIXPIPE-O 开始时间）
+        ub_c2_slot, ub_c2_avail = 0, 0.0
+        if ub_c2_tracker is not None:
+            ub_c2_slot, ub_c2_avail = ub_c2_tracker.allocate(0.0)
 
         # P路径 (同Q路径): 标准模式使用MTE2A/MTE1A; DN模式使用MTE2B/MTE1B
         l1_name_p = map_q['l1']
@@ -1080,7 +1121,7 @@ class C1Modeler:
 
         # F. MTE3 (P从UB搬到L1)
         dur_mte3 = self._calc_mte3_cycles(size_p_mte3)
-        start_mte3 = max(resource_free_time["MTE3"], p_ready_time)
+        start_mte3 = max(resource_free_time["MTE3"], p_ready_time, l1p_avail)
         end_mte3 = start_mte3 + dur_mte3
 
         self.timeline.append(TimelineEvent(
@@ -1089,6 +1130,9 @@ class C1Modeler:
         ))
         resource_free_time["MTE3"] = end_mte3
         l1_cache.store_p(f"P{q_idx}_{k_idx}", size_p_mte3, end_mte3)
+        # MTE3 完成后释放 UB_C1 槽（P 已从 UB 搬出）
+        if ub_c1_tracker is not None and ub_c1_slot is not None:
+            ub_c1_tracker.release(ub_c1_slot, end_mte3)
 
         # G. MTE1 (P从L1搬到L0A/L0B)
         size_p_mte1 = size_p_mte3
@@ -1102,6 +1146,9 @@ class C1Modeler:
         ))
         resource_free_time["MTE1"] = end_mte1_p
         l0_slots_p[slot_l0_p] = end_mte1_p
+        # MTE1-P 完成后释放 L1_P 槽（P 已搬到 L0，L1 槽可复用）
+        if l1p_tracker is not None:
+            l1p_tracker.release(l1p_slot, end_mte1_p)
 
         # V加载是否使用L2缓存 (q_idx>0时同一V块第二次访问)
         use_l2_for_v = self.is_l2cache and (q_idx > 0)
@@ -1167,7 +1214,7 @@ class C1Modeler:
             l1_slots_v[slot_l1_v]['mte1_free'] = resource_free_time["MTE1"]
             size_fo = self._calc_fixpipe_o_size()
             dur_fix_o = self._calc_fixpipe_cycles(size_fo)
-            start_fix_o = max(resource_free_time["FIXPIPE"], last_mac_end_c2)
+            start_fix_o = max(resource_free_time["FIXPIPE"], last_mac_end_c2, ub_c2_avail)
             end_fix_o = start_fix_o + dur_fix_o
             self.timeline.append(TimelineEvent(
                 "FIXPIPE", "O", start_fix_o, end_fix_o, dur_fix_o,
@@ -1238,7 +1285,7 @@ class C1Modeler:
 
                 size_o = self._calc_fixpipe_o_size()
                 dur_fix_o = self._calc_fixpipe_cycles(size_o)
-                start_fix_o = max(resource_free_time["FIXPIPE"], last_mac_end_c2)
+                start_fix_o = max(resource_free_time["FIXPIPE"], last_mac_end_c2, ub_c2_avail)
                 end_fix_o = start_fix_o + dur_fix_o
                 self.timeline.append(TimelineEvent(
                     "FIXPIPE", "O", start_fix_o, end_fix_o, dur_fix_o,
@@ -1282,7 +1329,7 @@ class C1Modeler:
                 # J. FIXPIPE (搬运O矩阵到UB)
                 size_o = self._calc_fixpipe_o_size()
                 dur_fix_o = self._calc_fixpipe_cycles(size_o)
-                start_fix_o = max(resource_free_time["FIXPIPE"], end_mac_c2)
+                start_fix_o = max(resource_free_time["FIXPIPE"], end_mac_c2, ub_c2_avail)
                 end_fix_o = start_fix_o + dur_fix_o
 
                 self.timeline.append(TimelineEvent(
@@ -1302,6 +1349,9 @@ class C1Modeler:
             "CUBE", q_idx, k_idx
         ))
         resource_free_time["VECTOR"] = end_vector_v2
+        # V2 完成后释放 UB_C2 槽
+        if ub_c2_tracker is not None:
+            ub_c2_tracker.release(ub_c2_slot, end_vector_v2)
         return end_vector_v2
 
     def _process_k_blocks(
@@ -1741,6 +1791,39 @@ class C1Modeler:
             self.use_dn, self.L0_db, filename
         )
 
+    def _compute_phase_stats(self) -> Dict:
+        """计算每个基本块各阶段平均耗时（各阶段总 duration / 块数）。
+
+        阶段分类：
+          C1: MTE2/MTE1-Q(Q预加载) + MTE2/MTE1-K + MAC-P + FIXPIPE-P
+          V1: VECTOR_V1 + MTE3-P + MTE1-P(C2路由)
+          C2: MTE2/MTE1-V + MAC-O + FIXPIPE-O
+          V2: VECTOR_V2
+        """
+        def classify_phase(unit: str, op: str) -> Optional[str]:
+            if unit == "VECTOR_V1":  return "V1"
+            if unit == "VECTOR_V2":  return "V2"
+            if unit == "MTE3":       return "V1"   # P路由归入V1
+            if unit == "MAC":        return "C1" if op == "P" else "C2"
+            if unit == "FIXPIPE":    return "C1" if op == "P" else "C2"
+            if "Q" in op:            return "C1"   # Q预加载均摊入C1
+            if "K" in op:            return "C1"
+            if "V" in op:            return "C2"
+            if "P" in op:            return "V1"   # MTE1-P C2路由归入V1
+            return None
+
+        phase_totals: Dict[str, float] = {"C1": 0.0, "V1": 0.0, "C2": 0.0, "V2": 0.0}
+        for e in self.timeline:
+            ph = classify_phase(e.unit, e.operation)
+            if ph:
+                phase_totals[ph] += e.duration
+
+        n_blocks = self.q_block_count * self.k_block_count
+        result: Dict = {ph: total / n_blocks for ph, total in phase_totals.items()}
+        result["total"]    = sum(result[ph] for ph in ("C1", "V1", "C2", "V2"))
+        result["n_blocks"] = n_blocks
+        return result
+
     def print_performance(self, unit_times: Dict, total_cycles: float):
         """打印性能分析"""
         c1_type, c1_count = self._get_c1_split()
@@ -1749,3 +1832,16 @@ class C1Modeler:
         c2_label = f"matmul{c2_type}" if c2_type != 'full' else "matmulFull"
         print(f"C1 模板: {c1_label} (sub_count={c1_count})  |  C2 模板: {c2_label} (sub_count={c2_count})")
         TimelineVisualizer.print_performance(unit_times, total_cycles)
+
+        stats = self._compute_phase_stats()
+        n = stats["n_blocks"]
+        print(f"\n=== 基本块平均耗时 (共 {n} 块) ===")
+        rows = [
+            ("C1", stats["C1"], "Q预加载(均摊) + K加载 + 矩阵乘 + FIXPIPE"),
+            ("V1", stats["V1"], "Softmax + P路由"),
+            ("C2", stats["C2"], "V加载 + 矩阵乘 + FIXPIPE"),
+            ("V2", stats["V2"], "后处理"),
+        ]
+        for label, val, desc in rows:
+            print(f"  {label:<4} {val:>9.1f}  cycles   ({desc})")
+        print(f"  {'合计':<4} {stats['total']:>9.1f}  cycles")
